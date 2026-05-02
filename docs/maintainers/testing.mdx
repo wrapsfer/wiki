@@ -5,4 +5,104 @@ sidebar_label: Testing
 
 # Testing
 
-_Stub page. Content will be authored in Phase 13._
+How the Wrapsfer API is tested today, and the commands used to run those tests locally. Two test projects live under `tests/`:
+
+- `Wrapsfer.UnitTests` — fast tests for the Domain layer (and Application code, when it grows).
+- `Wrapsfer.IntegrationTests` — endpoint tests that boot the API in-memory via `Microsoft.AspNetCore.Mvc.Testing`.
+
+Both use **xUnit 2.9.3** with the standard MSBuild test runner (`Microsoft.NET.Test.Sdk 17.14.1`) and `coverlet.collector 6.0.4` for coverage. Verified against `tests/Wrapsfer.UnitTests/Wrapsfer.UnitTests.csproj` and `tests/Wrapsfer.IntegrationTests/Wrapsfer.IntegrationTests.csproj`.
+
+## Running The Tests
+
+From the API repository root:
+
+```bash
+dotnet test
+```
+
+`dotnet test` discovers every test project listed in `Wrapsfer.slnx` and runs them. Subset commands:
+
+```bash
+# unit tests only
+dotnet test tests/Wrapsfer.UnitTests
+
+# integration tests only
+dotnet test tests/Wrapsfer.IntegrationTests
+
+# skip restore / build when you have already built the solution
+dotnet test --no-build
+
+# run a single test by name
+dotnet test --filter "FullyQualifiedName~GreetingsEndpointTests"
+```
+
+The integration tests spin up the API host in-process on each `IClassFixture<WebApplicationFactory<Program>>`, so no separate `dotnet run` is required.
+
+## Unit Tests — `Wrapsfer.UnitTests`
+
+References `Wrapsfer.Application` and `Wrapsfer.Domain`. Today it contains a single test class that pins the existing domain rules.
+
+`tests/Wrapsfer.UnitTests/GreetingTests.cs`:
+
+| Test | What it asserts |
+| ---- | --------------- |
+| `Create_TrimsNameAndFormatsMessage` | `Greeting.Create("  Vernon  ")` produces `Name == "Vernon"` and `Message == "Hello, Vernon!"` — covers the trimming and message-format rules. |
+| `Create_ThrowsWhenNameIsBlank`      | `Greeting.Create("   ")` throws `ArgumentException` — covers the non-empty-after-trim invariant. |
+
+Both rules are documented under [Business Rules → Domain Rules](../api/business-rules#domain-rules--greeting). When new domain or application behavior is added, follow the same pattern: add a focused unit test to this project before exposing the behavior through HTTP.
+
+## Integration Tests — `Wrapsfer.IntegrationTests`
+
+References `Wrapsfer.Api` and pulls in `Microsoft.AspNetCore.Mvc.Testing 10.0.7`. Each test class implements `IClassFixture<WebApplicationFactory<Program>>` to share an in-memory host across the class's tests.
+
+Two test classes today:
+
+`tests/Wrapsfer.IntegrationTests/HealthEndpointTests.cs`:
+
+| Test | What it asserts |
+| ---- | --------------- |
+| `Health_ReturnsOk` | `GET /health` returns `200 OK` from the in-memory host. |
+
+`tests/Wrapsfer.IntegrationTests/GreetingsEndpointTests.cs`:
+
+| Test | What it asserts |
+| ---- | --------------- |
+| `Get_ReturnsGreeting` | `GET /api/greetings?name=Vernon` returns `200 OK`; the JSON body deserializes into `(string Message, DateTimeOffset GeneratedAt)` and `Message == "Hello, Vernon!"`. |
+
+The deserialization succeeding also implicitly confirms the camelCase wire shape — see [Endpoint Reference → Success response](../api/endpoint-reference#success-response).
+
+These tests do **not** assert the validation-failure path or the 500 problem-details body. When validation or error-handling behavior changes, add tests that pin those responses.
+
+### How `WebApplicationFactory<Program>` Works Here
+
+- `Wrapsfer.Api/Program.cs` declares `public partial class Program;` at the bottom of the file. This makes the top-level program statements addressable as a class, which `WebApplicationFactory<Program>` uses as the entry point for the in-memory host.
+- `factory.CreateClient()` returns an `HttpClient` rooted at the in-memory server (e.g. `http://localhost`). Tests issue real `HttpRequestMessage`s through it; ASP.NET Core's pipeline runs end to end, including `ExceptionHandlingMiddleware`, CORS, and routing.
+- The `IClassFixture<WebApplicationFactory<Program>>` fixture is shared across the class, so the host is constructed once per class and disposed afterwards.
+- No test substitutes services today (`factory.WithWebHostBuilder(...)` is not used). The integration tests run against the same DI graph as production (`TimeProvider.System`, real options binding, real CORS policy). Substitute services per test class only when needed.
+
+## Quality Check Commands
+
+Safe, repeatable commands to run before committing changes:
+
+```bash
+dotnet restore                # pull NuGet packages
+dotnet build --no-restore     # compile every project
+dotnet test --no-build        # run all xUnit tests against the just-built bits
+```
+
+These three commands match the workflow from `api/README.md` ("Quality Checks") and avoid redundant restore/build cycles when chained. Each is idempotent: running them on a clean checkout reproduces the same artifacts.
+
+For coverage:
+
+```bash
+dotnet test --collect:"XPlat Code Coverage"
+```
+
+This uses `coverlet.collector` (already referenced by both test projects) to emit a Cobertura XML file under each test project's `TestResults/` directory.
+
+## See Also
+
+- [Architecture](./architecture) — what each project layer is responsible for, and where new tests should live.
+- [Development Workflow](./development-workflow) — recommended flow for adding a feature, including where tests fit in.
+- [Endpoint Reference](../api/endpoint-reference) — the contracts the integration tests assert against.
+- [Business Rules](../api/business-rules) — the rules the unit tests pin.
