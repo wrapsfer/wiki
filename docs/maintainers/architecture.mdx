@@ -5,4 +5,131 @@ sidebar_label: Architecture
 
 # Architecture
 
-_Stub page. Content will be authored in Phase 7._
+The Wrapsfer API uses a small Clean Architecture-style layout: four projects under `src/` with strictly inward-pointing dependencies, and two test projects under `tests/`. This page describes the layout that exists today and where future code should live.
+
+## Project Layout
+
+```text
+src/
+  Wrapsfer.Api/
+    Controllers/             HTTP endpoints
+    Middleware/              Request pipeline middleware
+    Properties/              launchSettings.json
+    Program.cs               Application startup and pipeline configuration
+    appsettings.json         Base configuration
+    appsettings.Development.json
+    Wrapsfer.Api.csproj      Microsoft.NET.Sdk.Web
+
+  Wrapsfer.Application/
+    Greetings/               Sample application service and contract
+                             (IGreetingService, GreetingService, GreetingResponse)
+    DependencyInjection.cs   AddApplication() service registrations
+
+  Wrapsfer.Domain/
+    Greetings/               Sample domain model (Greeting)
+
+  Wrapsfer.Infrastructure/
+    Options/                 Configuration-bound options (AppOptions)
+    DependencyInjection.cs   AddInfrastructure(IConfiguration) registrations
+
+tests/
+  Wrapsfer.UnitTests/        Fast tests for domain/application behavior
+  Wrapsfer.IntegrationTests/ API-level tests using WebApplicationFactory<Program>
+```
+
+The solution file is `Wrapsfer.slnx` at the repo root.
+
+## Dependency Direction
+
+Project references (verified in each `.csproj`):
+
+| Project                     | References                                  |
+| --------------------------- | ------------------------------------------- |
+| `Wrapsfer.Api`              | `Wrapsfer.Application`, `Wrapsfer.Infrastructure` |
+| `Wrapsfer.Infrastructure`   | `Wrapsfer.Application`, `Wrapsfer.Domain`   |
+| `Wrapsfer.Application`      | `Wrapsfer.Domain`                           |
+| `Wrapsfer.Domain`           | *(none)*                                    |
+| `Wrapsfer.UnitTests`        | `Wrapsfer.Application`, `Wrapsfer.Domain`   |
+| `Wrapsfer.IntegrationTests` | `Wrapsfer.Api`                              |
+
+Visual summary:
+
+```text
+Api  ─►  Application  ─►  Domain
+ │           ▲              ▲
+ ▼           │              │
+Infrastructure ──────────────┘
+```
+
+Dependencies always point **inward**: Domain depends on nothing; Application depends only on Domain; Infrastructure depends on Application and Domain; Api composes everything. There are no outward references and Domain has zero project or framework references that would tie it to ASP.NET Core, configuration, DI extensions, EF Core, etc.
+
+## Layer Responsibilities
+
+### `Wrapsfer.Domain`
+
+The innermost layer. Contains domain models and rules that are independent of frameworks, persistence, and HTTP.
+
+- Today: the `Greeting` record (validates `name` is non-empty, exposes `Message`).
+- Has **no** project or NuGet references — `Wrapsfer.Domain.csproj` only sets target framework, nullable, and implicit usings.
+- New domain rules and invariants belong here, expressed as types and methods that can be unit-tested without any framework setup.
+
+### `Wrapsfer.Application`
+
+Use cases, contracts, and application-level orchestration. Talks to Domain; abstracts away from HTTP and infrastructure.
+
+- Today: `IGreetingService` / `GreetingService` and the `GreetingResponse` DTO; `DependencyInjection.AddApplication()` registers `IGreetingService` as `Scoped`.
+- References Domain only (`ProjectReference` to `Wrapsfer.Domain`); pulls in `Microsoft.Extensions.DependencyInjection.Abstractions` so it can expose its own `AddApplication()` extension.
+- New use-case interfaces and services belong here. Application code may depend on abstractions for infrastructure concerns (e.g. clocks, repositories) but should not reference concrete infrastructure types.
+
+### `Wrapsfer.Infrastructure`
+
+Concrete adapters and configuration binding. Provides implementations for things the Application layer abstracts.
+
+- Today: `Options/AppOptions` (`SectionName = "App"`, `Name = "Wrapsfer API"`); `DependencyInjection.AddInfrastructure(IConfiguration)` registers `TimeProvider.System` as a singleton and binds `AppOptions` from the `App` configuration section.
+- References `Wrapsfer.Application` and `Wrapsfer.Domain`; pulls in `Microsoft.Extensions.Options.ConfigurationExtensions` for `Configure<T>(IConfigurationSection)`.
+- Persistence, external HTTP clients, message brokers, file system access, and other I/O-heavy adapters belong here when they are added.
+
+### `Wrapsfer.Api`
+
+The composition root and HTTP surface. Wires everything together and exposes endpoints.
+
+- Today: `Program.cs` registers controllers, OpenAPI, health checks, CORS, then calls `AddApplication()` and `AddInfrastructure(builder.Configuration)`; the pipeline is `ExceptionHandlingMiddleware` → `UseHttpsRedirection` → `UseCors("DefaultCors")` → `UseAuthorization` → health checks + controllers; OpenAPI is mapped only in `Development`.
+- `Controllers/GreetingsController` is the only controller today; `Middleware/ExceptionHandlingMiddleware` returns `application/problem+json` 500 for unhandled exceptions.
+- References `Application` and `Infrastructure`; uses `Microsoft.NET.Sdk.Web` and `Microsoft.AspNetCore.OpenApi`.
+- New HTTP endpoints, request/response shapes specific to HTTP, middleware, and pipeline configuration belong here.
+
+### Tests
+
+- `Wrapsfer.UnitTests` references `Application` and `Domain`. Use it for fast tests of domain rules and application services that do not need an HTTP host.
+- `Wrapsfer.IntegrationTests` references `Api` and uses `Microsoft.AspNetCore.Mvc.Testing.WebApplicationFactory<Program>` to spin up the in-memory host. Use it for endpoint behavior — status codes, headers, response bodies.
+
+## Where To Add New Behavior
+
+A typical feature flows from inside out:
+
+1. **Express the rule in `Wrapsfer.Domain`.** Add the type, invariants, and behavior as plain C#. No framework references.
+2. **Define the use case in `Wrapsfer.Application`.** Add an interface plus an implementation that orchestrates Domain. Register it in `AddApplication()`. If the use case needs an external dependency (clock, repository, HTTP client), depend on an abstraction defined in Application.
+3. **Provide the adapter in `Wrapsfer.Infrastructure`** *only if needed*. Implement the abstraction and register it in `AddInfrastructure(IConfiguration)`. Bind any new `appsettings` section through `Configure<T>`.
+4. **Expose the behavior in `Wrapsfer.Api`.** Add a controller (or extend an existing one) that calls the application service. Keep request/response shapes specific to HTTP in this layer; let the application return its own DTOs.
+5. **Add unit tests in `Wrapsfer.UnitTests`** for domain and application behavior.
+6. **Add integration tests in `Wrapsfer.IntegrationTests`** for the HTTP behavior using `WebApplicationFactory<Program>`.
+
+### Things To Keep Out Of Domain
+
+- ASP.NET Core types (`HttpContext`, `IActionResult`, `ControllerBase`, attributes like `[FromQuery]`).
+- Configuration / DI types (`IConfiguration`, `IServiceCollection`, `IOptions<T>`).
+- Persistence concerns (EF Core entities, `DbContext`, repository implementations).
+- Logging and telemetry frameworks.
+
+If a domain operation needs the current time, an external service, or persistence, express the dependency as an abstraction owned by Domain or Application and implement it in Infrastructure. The current code follows this rule (e.g. `GreetingService` takes `TimeProvider` from DI rather than calling `DateTimeOffset.UtcNow` directly).
+
+### Things To Keep Out Of Application
+
+- HTTP-specific types and attributes.
+- Concrete infrastructure (database connections, file system access, third-party SDKs). Reference abstractions instead and let Infrastructure implement them.
+
+## See Also
+
+- [Configuration](./configuration) — how `AppOptions`, CORS, and other settings are bound.
+- [Testing](./testing) — what `Wrapsfer.UnitTests` and `Wrapsfer.IntegrationTests` cover.
+- [Development Workflow](./development-workflow) — recommended flow for adding a feature, end to end.
