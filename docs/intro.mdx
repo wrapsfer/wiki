@@ -1,14 +1,54 @@
 ---
 sidebar_position: 1
+title: Wrapsfer API Documentation
+sidebar_label: Introduction
 ---
 
 # Wrapsfer API Documentation
 
-This site documents the current Wrapsfer API behavior for API consumers,
-backend developers, and future maintainers.
+Reference for the **current** behavior of the Wrapsfer API, written for API
+consumers, backend developers, and future maintainers.
 
-## Scope
+## What Wrapsfer API Is Today
 
-- Document current API behavior only.
-- Do not present planned future behavior as existing behavior.
-- Keep starter Docusaurus tutorial and blog content out of the published docs.
+Wrapsfer API is a minimal **.NET 10 Web API boilerplate** organized around a
+small Clean Architecture-style layout (`Api`, `Application`, `Domain`,
+`Infrastructure`). It ships with the production-oriented foundations a service
+typically needs — health checks, OpenAPI in development, configuration,
+dependency injection, CORS, global exception handling, data-annotation
+validation, unit and integration tests, and Docker support — without any
+authentication, persistence, or vendor-specific dependencies.
+
+The functional surface today is a **sample greeting endpoint** that exists to
+demonstrate the layering. Real domain endpoints have not been added yet.
+
+This documentation describes only what exists in the codebase. It does not
+describe planned future behavior.
+
+## Current Endpoints
+
+| Method | Path                          | Notes                                          |
+| ------ | ----------------------------- | ---------------------------------------------- |
+| `GET`  | `/health`                     | Service health check.                          |
+| `GET`  | `/api/greetings?name={name}`  | Sample greeting from the application/domain layers. `name` is validated by `[StringLength]`. |
+| `GET`  | `/openapi/v1.json`            | OpenAPI document. Available in **development** only. |
+
+Quick check against a locally running instance:
+
+```bash
+curl http://localhost:8080/health
+curl "http://localhost:8080/api/greetings?name=Vernon"
+```
+
+## Where To Go Next
+
+For API consumers:
+
+- [API Overview](./api/overview) — what the API is and how it is structured.
+- [Getting Started](./api/getting-started) — run the API locally and call an endpoint.
+- [Endpoint Reference](./api/endpoint-reference) — request/response details for each endpoint.
+
+For backend developers and maintainers:
+
+- [Configuration](./maintainers/configuration) — `appsettings.json`, environment variables, CORS, and app options.
+- [Development Workflow](./maintainers/development-workflow) — recommended flow for adding a feature.
