@@ -5,4 +5,114 @@ sidebar_label: Overview
 
 # API Overview
 
-_Stub page. Content will be authored in Phase 5._
+A high-level view of what the Wrapsfer API is **today**. It is a deliberately
+small .NET 10 Web API boilerplate organized around a Clean
+Architecture-style layout. This page documents what is implemented in the
+codebase and is explicit about what is intentionally not.
+
+## Purpose
+
+The Wrapsfer API exists as a reusable starting point for building a .NET Web
+API. It provides production-oriented foundations — health checks, OpenAPI in
+development, configuration binding, dependency injection, CORS, global
+exception handling, and a tested layering between HTTP, application, domain,
+and infrastructure code — without committing to authentication, a database,
+external integrations, or a particular cloud target.
+
+The only functional surface today is a **sample greeting endpoint** that
+demonstrates how a request flows through the controller, application service,
+and domain model.
+
+## Current Stack
+
+- **.NET 10** Web API (`net10.0`).
+- **ASP.NET Core controllers** (`AddControllers` + `[ApiController]`).
+- **OpenAPI** via `AddOpenApi` / `MapOpenApi`, exposed only when
+  `app.Environment.IsDevelopment()` is true.
+- **Health checks** via `AddHealthChecks` mapped to `/health`.
+- **Dependency injection** split by layer:
+  - `Wrapsfer.Application.DependencyInjection.AddApplication()` registers
+    application services (`IGreetingService` → `GreetingService`, scoped).
+  - `Wrapsfer.Infrastructure.DependencyInjection.AddInfrastructure(configuration)`
+    registers `TimeProvider.System` and binds `AppOptions` from configuration.
+- **Configuration** loaded from `appsettings.json`,
+  `appsettings.Development.json`, environment variables, and command-line
+  arguments. Bound sections: `App` (`AppOptions.Name`) and `Cors:AllowedOrigins`.
+- **CORS** through a single `DefaultCors` policy: if
+  `Cors:AllowedOrigins` contains entries, the policy restricts to those origins
+  with any header and any method; if the list is empty or missing, the policy
+  falls back to **allow any origin / header / method** (suitable for local
+  development, not for production).
+- **Middleware pipeline**: `ExceptionHandlingMiddleware` →
+  `UseHttpsRedirection` → `UseCors("DefaultCors")` → `UseAuthorization` →
+  health checks and controllers.
+- **Global exception handling** via `ExceptionHandlingMiddleware`: unhandled
+  exceptions are logged and returned as `application/problem+json` with
+  HTTP `500`.
+- **Validation** via ASP.NET Core model binding + `[ApiController]` and
+  data-annotation attributes (e.g. `[StringLength(80, MinimumLength = 1)]` on
+  the greeting `name` query string).
+- **Testing** with xUnit:
+  - `Wrapsfer.UnitTests` — domain/application unit tests.
+  - `Wrapsfer.IntegrationTests` — API tests using
+    `Microsoft.AspNetCore.Mvc.Testing.WebApplicationFactory<Program>`.
+- **Docker / Docker Compose** support via the project's `Dockerfile` and
+  `docker-compose.yml`. The container listens on port `8080`.
+
+## Solution Layout
+
+```text
+src/
+  Wrapsfer.Api/             ASP.NET Core host, controllers, middleware, Program.cs
+  Wrapsfer.Application/     Use-case services and contracts (e.g. GreetingService)
+  Wrapsfer.Domain/          Domain models (e.g. Greeting)
+  Wrapsfer.Infrastructure/  Configuration options and infrastructure registrations
+tests/
+  Wrapsfer.UnitTests/
+  Wrapsfer.IntegrationTests/
+```
+
+Dependency direction: `Api` → (`Application`, `Infrastructure`),
+`Infrastructure` → (`Application`, `Domain`), `Application` → `Domain`,
+`Domain` → none.
+
+## Endpoints (Summary)
+
+| Method | Path                          | Auth | Notes                                        |
+| ------ | ----------------------------- | ---- | -------------------------------------------- |
+| `GET`  | `/health`                     | None | ASP.NET Core health checks endpoint.         |
+| `GET`  | `/api/greetings?name={name}`  | None | Sample endpoint. `name` defaults to `"World"`; validated `[StringLength(80, MinimumLength = 1)]`. |
+| `GET`  | `/openapi/v1.json`            | None | OpenAPI document. **Development only.**      |
+
+Full request/response details live on the
+[Endpoint Reference](./endpoint-reference) page.
+
+## Not Implemented
+
+The following are intentionally omitted from the boilerplate. They are not
+present in the codebase today and should not be assumed by consumers.
+
+- **Authentication.** No authentication scheme is registered. The pipeline
+  calls `UseAuthorization`, but no authorization policies are defined and no
+  endpoints require authorization.
+- **Persistence.** No database, no EF Core, no repositories, no migrations.
+- **External integrations.** No third-party SDKs, message brokers, queues,
+  caches, or HTTP clients to external services.
+- **Production cloud setup.** No deployment manifests for any cloud
+  provider, no infrastructure-as-code, no production-grade CORS / TLS /
+  hosting configuration. The Docker setup targets local execution.
+- **Domain endpoints beyond the sample.** Only the greeting demonstrates the
+  layering; no business endpoints exist yet.
+- **Authorization policies.** The `UseAuthorization` middleware is wired in,
+  but there are no `[Authorize]` attributes or policy definitions in the
+  current code.
+
+When any of these are added, they should be documented as they land — not
+before.
+
+## Where To Go Next
+
+- [Getting Started](./getting-started) — run the API locally and call an endpoint.
+- [Endpoint Reference](./endpoint-reference) — request/response details.
+- [Errors & Validation](./errors-validation) — error contract and validation behavior.
+- [Configuration](../maintainers/configuration) — `appsettings.json`, environment variables, CORS, and app options.
