@@ -5,4 +5,116 @@ sidebar_label: Errors & Validation
 
 # Errors and Validation
 
-_Stub page. Content will be authored in Phase 10._
+How the Wrapsfer API responds to invalid requests today, and how unhandled exceptions are translated into HTTP responses. Both flows return RFC 7807 `application/problem+json` bodies but come from different layers — model validation is provided by ASP.NET Core, and the 500 fallback is provided by `ExceptionHandlingMiddleware`.
+
+## Summary
+
+| Failure                                  | Source                              | Status | Content-Type                  |
+| ---------------------------------------- | ----------------------------------- | ------ | ----------------------------- |
+| Request fails model validation           | `[ApiController]` automatic 400     | `400`  | `application/problem+json`    |
+| Unhandled exception during a request     | `ExceptionHandlingMiddleware`       | `500`  | `application/problem+json`    |
+
+Endpoints today do not throw `4xx` for business reasons (no authentication, no authorization policies, no domain validation surfaces beyond what `StringLength` covers). When such cases are added, document them then — see [Recommendations](#recommendations-for-future-errors) at the bottom of this page.
+
+## Model Validation
+
+`GreetingsController` is annotated with `[ApiController]`, which enables ASP.NET Core's **automatic model-state validation**. When binding produces any `ModelState` errors, the framework short-circuits the action and returns `400 Bad Request` with a `ValidationProblemDetails` body — the action method is never invoked.
+
+The only validated input today is the greeting endpoint's `name` query parameter, decorated with `[StringLength(80, MinimumLength = 1)]`. This means:
+
+- `?name=` (empty string) — fails `MinimumLength = 1`.
+- `?name=` followed by 81+ characters — fails `MaximumLength = 80`.
+- `?name=` 1–80 characters — passes.
+- Omitted entirely — uses the controller default `"World"` and passes.
+
+### Example: empty `name`
+
+```bash
+curl -i "http://localhost:8080/api/greetings?name="
+```
+
+```http
+HTTP/1.1 400 Bad Request
+Content-Type: application/problem+json; charset=utf-8
+
+{
+  "type": "https://tools.ietf.org/html/rfc9110#section-15.5.1",
+  "title": "One or more validation errors occurred.",
+  "status": 400,
+  "errors": {
+    "name": [
+      "The field name must be a string with a minimum length of 1 and a maximum length of 80."
+    ]
+  },
+  "traceId": "00-..."
+}
+```
+
+### Notes on the response
+
+- **Body shape** is `ValidationProblemDetails` — the standard ASP.NET Core 400 problem-details document with an `errors` map keyed by the offending parameter name.
+- **Error message wording** is the framework default for `StringLengthAttribute` and is not customized in the codebase. Treat the exact text as informational only; the structure is the contract.
+- **`type` URI** points at the relevant RFC section, again ASP.NET Core's default.
+- **`traceId`** is the current activity trace identifier when one is available. The exact value will differ per request.
+- The middleware pipeline runs before automatic validation, so `ExceptionHandlingMiddleware` is not involved in this path.
+
+## Unhandled Exceptions — `ExceptionHandlingMiddleware`
+
+`Wrapsfer.Api.Middleware.ExceptionHandlingMiddleware` wraps the rest of the pipeline. If any downstream code (controller, application service, domain) throws an exception that nothing else catches, the middleware:
+
+1. Logs the exception via `ILogger<ExceptionHandlingMiddleware>.LogError` with message `"Unhandled exception occurred while processing the request."`.
+2. Constructs a `ProblemDetails` document and serializes it as `application/problem+json` with HTTP `500`.
+
+The middleware is registered first in the pipeline (`app.UseMiddleware<ExceptionHandlingMiddleware>();` before any other `Use*` call in `Program.cs`), so it sees exceptions from CORS, authorization, controllers, and any other middleware that runs after it.
+
+### Response shape
+
+| Field      | Value                                                |
+| ---------- | ---------------------------------------------------- |
+| `status`   | `500`                                                |
+| `title`    | `"An unexpected error occurred."`                    |
+| `detail`   | `"Contact support if the problem persists."`         |
+| `instance` | `context.Request.Path` — the request path that threw |
+
+`type` is not set by the middleware (the `ProblemDetails` default applies). No exception type, message, or stack trace is leaked to the response body — those go to logs only.
+
+### Example
+
+```http
+HTTP/1.1 500 Internal Server Error
+Content-Type: application/problem+json
+
+{
+  "title": "An unexpected error occurred.",
+  "status": 500,
+  "detail": "Contact support if the problem persists.",
+  "instance": "/api/greetings"
+}
+```
+
+There is no current endpoint that intentionally produces this response — it is the safety net for unanticipated failures.
+
+## Other HTTP Responses
+
+Behaviors that are part of the framework but not customized in source:
+
+- **`404 Not Found`** for any unmapped route (e.g. `/openapi/v1.json` outside `Development`, or any path other than `/health`, `/api/greetings`, and the OpenAPI document). ASP.NET Core endpoint routing handles this; no custom 404 response is configured.
+- **`405 Method Not Allowed`** if a method other than `GET` is sent to a `GET`-only endpoint. This is the framework default.
+- **HTTPS redirect** (`UseHttpsRedirection`) may issue a redirect for HTTP requests when an HTTPS port is configured (e.g. when running with the `https` launch profile).
+
+These are not implemented behaviors of the API per se — they fall out of ASP.NET Core defaults.
+
+## Recommendations For Future Errors
+
+These are guidance for future work, not current behavior:
+
+- **Expected validation and domain errors** (e.g. "name conflict", "resource not found", "insufficient permissions") should be handled explicitly — typically returning `400`, `404`, or `409` with their own problem-details documents — rather than being allowed to throw and reach `ExceptionHandlingMiddleware`. The 500 path should remain the unanticipated case.
+- **Domain `ArgumentException` from `Greeting.Create`** is currently shielded by the controller's `[StringLength(MinimumLength = 1)]`, which rejects whitespace/empty values before they reach the application or domain layer. If a future controller bypasses that validation, the exception will propagate and surface as a `500` — wire explicit handling at the application or controller layer when that becomes relevant.
+- **New problem types** should keep using `application/problem+json` for error responses to remain consistent with both existing flows.
+- **Authentication and authorization failures** are not implemented today; when added, they will produce `401` and `403` from the auth middleware — document those at that point.
+
+## See Also
+
+- [Endpoint Reference](./endpoint-reference) — successful request/response shapes.
+- [Business Rules](./business-rules) — what `name` means, what is and is not validated as a business rule.
+- [Architecture](../maintainers/architecture) — where validation, exception handling, and domain rules live.
