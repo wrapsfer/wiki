@@ -5,4 +5,130 @@ sidebar_label: Development Workflow
 
 # Development Workflow
 
-_Stub page. Content will be authored in Phase 14._
+How to add a feature to the Wrapsfer API while keeping the existing layer boundaries intact. The flow below mirrors what is already in source for the greeting sample — use it as a template when adding the next thing.
+
+For the project layout and what each layer is responsible for, see [Architecture](./architecture).
+
+## Feature Flow
+
+A typical feature is built **inside out**: from the domain model toward HTTP. Each layer should be testable on its own.
+
+1. **Domain (`Wrapsfer.Domain`)** — express the rule and invariants.
+   - Add a record/class for the concept under a feature folder, e.g. `Wrapsfer.Domain/Greetings/Greeting.cs`.
+   - Use a factory method (`Create`) to enforce invariants and keep the constructor private. Throw an exception (typically `ArgumentException`) for invalid input — see [Business Rules → Domain Rules](../api/business-rules#domain-rules--greeting) for the existing example.
+   - **No** ASP.NET Core, configuration, DI, or persistence types here. Domain has zero project or NuGet references.
+
+2. **Application (`Wrapsfer.Application`)** — define the use case.
+   - Add an interface and an implementation under the same feature folder, e.g. `IGreetingService` / `GreetingService`.
+   - Add a DTO for the use-case result, e.g. `GreetingResponse`. Keep DTOs in Application; do not return Domain entities through HTTP.
+   - If the use case needs a side-effect (clock, repository, HTTP client), depend on an **abstraction** owned by Application (or `TimeProvider` from BCL, as `GreetingService` does). Do not reference concrete Infrastructure types.
+   - Register the service in `Wrapsfer.Application.DependencyInjection.AddApplication()` — see [DI Registration Locations](#di-registration-locations).
+
+3. **Infrastructure (`Wrapsfer.Infrastructure`)** — provide adapters, only when needed.
+   - Implement abstractions defined in Application (or wire framework services like `TimeProvider.System`).
+   - Bind any new `appsettings` section through `services.Configure<TOptions>(configuration.GetSection(TOptions.SectionName))` in `AddInfrastructure(IConfiguration)`. Add the new options class under `Wrapsfer.Infrastructure/Options/`. See [Configuration](./configuration) for the patterns already in use.
+   - **Skip this step** if the use case is pure (no I/O, no external state). The greeting feature has only one Infrastructure touch point — the registered `TimeProvider.System` singleton.
+
+4. **API (`Wrapsfer.Api`)** — expose the behavior.
+   - Add a controller (or extend an existing one) under `src/Wrapsfer.Api/Controllers/`. Use `[ApiController]` and an explicit route (`[Route("api/[controller]")]` is the existing pattern).
+   - Receive the dependency through constructor injection (the controller's primary-constructor form, like `GreetingsController(IGreetingService greetingService)`).
+   - Decorate inputs with data annotations for HTTP-level validation (e.g. `[StringLength(80, MinimumLength = 1)]`). `[ApiController]` will short-circuit invalid requests with a `400` problem-details body — see [Errors & Validation](../api/errors-validation).
+   - Return `ActionResult<TResponse>` and the Application DTO directly; the framework handles JSON serialization (camelCase by default).
+
+5. **Unit tests (`Wrapsfer.UnitTests`)** — pin domain and application behavior.
+   - Add a test class under the corresponding feature folder, e.g. `tests/Wrapsfer.UnitTests/GreetingTests.cs`.
+   - Cover both happy-path and invariant violations. The existing `GreetingTests` covers trimming, message format, and the whitespace-rejection rule.
+
+6. **Integration tests (`Wrapsfer.IntegrationTests`)** — pin HTTP behavior.
+   - Add a test class implementing `IClassFixture<WebApplicationFactory<Program>>`.
+   - Cover at minimum the `200 OK` happy path. Add validation-failure or error-handling tests when those code paths exist for the feature.
+   - See [Testing](./testing) for the patterns already in use.
+
+## DI Registration Locations
+
+| What you are registering                                       | Where it goes                                                                 |
+| -------------------------------------------------------------- | ----------------------------------------------------------------------------- |
+| Application services (use cases)                               | `Wrapsfer.Application.DependencyInjection.AddApplication()`                   |
+| Infrastructure adapters and `IConfiguration`-bound options     | `Wrapsfer.Infrastructure.DependencyInjection.AddInfrastructure(IConfiguration)` |
+| Pure ASP.NET Core wiring (controllers, OpenAPI, health, CORS)  | `src/Wrapsfer.Api/Program.cs`                                                 |
+
+`Program.cs` composes the layers in this order:
+
+```csharp
+builder.Services.AddApplication();
+builder.Services.AddInfrastructure(builder.Configuration);
+```
+
+Both extension methods are static and return `IServiceCollection`. Add new registrations next to the existing ones; do not register layer-specific services directly in `Program.cs`.
+
+Lifetime conventions in the existing code:
+
+- **Scoped** — application services (`IGreetingService` → `GreetingService`).
+- **Singleton** — stateless infrastructure providers (`TimeProvider.System`).
+- **Options** — bound via `Configure<T>` in Infrastructure, consumed via `IOptions<T>` / `IOptionsSnapshot<T>` / `IOptionsMonitor<T>` from any layer that takes a project reference to Infrastructure.
+
+## When To Add Infrastructure
+
+Add an Infrastructure implementation when the feature needs **anything outside the process boundary or anything stateful that is not domain state**. Examples:
+
+- Persistence (database, EF Core `DbContext`, repository implementations).
+- Outbound HTTP calls to third-party services.
+- Message brokers, queues, caches.
+- File system or blob storage access.
+- Any framework adapter that the Application layer should not know about (logging frameworks beyond `ILogger<T>` are usually fine in any layer; everything else belongs here).
+
+**Do not** add Infrastructure for pure computation, formatting, or in-memory transformations — those belong in Application or Domain. Today the only Infrastructure touch points are `TimeProvider.System` and `AppOptions` binding.
+
+## Adding Persistence Later
+
+The boilerplate intentionally has no database. When persistence is needed:
+
+1. Add EF Core (or your chosen data-access stack) packages to `Wrapsfer.Infrastructure.csproj` only.
+2. Define the `DbContext`, entity configurations, and migrations under `Wrapsfer.Infrastructure/`. Do **not** put EF entities in Domain.
+3. If you keep distinct domain models and persistence models, map between them in Infrastructure.
+4. Define repository abstractions in Application (or use the `DbContext` directly from Application — pick one and stay consistent). Implement them in Infrastructure.
+5. Register the data-access services in `AddInfrastructure(IConfiguration)`. Bind connection strings through configuration (`appsettings.json` + env vars) following the existing `AppOptions` pattern.
+6. Update [Configuration](./configuration) and [Architecture](./architecture) docs as part of the same change.
+
+This is future work — none of it exists today.
+
+## Adding Authentication Later
+
+Authentication is intentionally omitted today. The pipeline already calls `app.UseAuthorization()`, but no scheme is registered and no policies or `[Authorize]` attributes exist (see [Business Rules → What Is Intentionally Not A Business Rule Today](../api/business-rules)).
+
+When auth is needed:
+
+1. Add the authentication scheme(s) in `src/Wrapsfer.Api/Program.cs` via `builder.Services.AddAuthentication(...)` and the matching `Add{Scheme}` calls (JWT bearer, cookies, etc.).
+2. Add `app.UseAuthentication()` to the pipeline **before** `app.UseAuthorization()`.
+3. Define authorization policies via `builder.Services.AddAuthorization(...)` and apply them with `[Authorize(Policy = "...")]` on controllers/actions.
+4. Decide where claims and identity-related logic live — typically in a small adapter inside `Wrapsfer.Api` or `Wrapsfer.Infrastructure`, kept away from Domain.
+5. Document the new error responses (typically `401`/`403`) on [Errors & Validation](../api/errors-validation) when they are added.
+
+This is future work — none of it exists today.
+
+## Expected Test Additions Per Feature
+
+For every feature added, expect to add:
+
+- At least one **unit test** in `Wrapsfer.UnitTests` for each new domain rule (happy path + each invariant).
+- At least one **unit test** for each new application service path that is non-trivial (orchestration, mapping, conditional logic).
+- At least one **integration test** in `Wrapsfer.IntegrationTests` for the happy-path HTTP response.
+- An **integration test** for any new validation failure or error path, once that path has explicit handling.
+
+Run the full quality sequence before opening a PR:
+
+```bash
+dotnet restore
+dotnet build --no-restore
+dotnet test --no-build
+```
+
+See [Testing → Quality Check Commands](./testing#quality-check-commands).
+
+## See Also
+
+- [Architecture](./architecture) — layer responsibilities and dependency direction.
+- [Configuration](./configuration) — adding new bound options.
+- [Testing](./testing) — what tests exist today and how to add more.
+- [Business Rules](../api/business-rules) — current rules to model new features against.
+- [Errors & Validation](../api/errors-validation) — error contract for new endpoints.
