@@ -11,32 +11,32 @@ type FeatureItem = {
 
 const FeatureList: FeatureItem[] = [
   {
-    title: 'Easy to Use',
+    title: 'Current API Behavior',
     Svg: require('@site/static/img/undraw_docusaurus_mountain.svg').default,
     description: (
       <>
-        Docusaurus was designed from the ground up to be easily installed and
-        used to get your website up and running quickly.
+        Documentation focuses on behavior that exists today so integrations can
+        rely on accurate request, response, and workflow details.
       </>
     ),
   },
   {
-    title: 'Focus on What Matters',
+    title: 'Consumer Ready',
     Svg: require('@site/static/img/undraw_docusaurus_tree.svg').default,
     description: (
       <>
-        Docusaurus lets you focus on your docs, and we&apos;ll do the chores. Go
-        ahead and move your docs into the <code>docs</code> directory.
+        API consumers can find the implementation details they need without
+        default starter tutorials or unrelated blog content.
       </>
     ),
   },
   {
-    title: 'Powered by React',
+    title: 'Maintainer Friendly',
     Svg: require('@site/static/img/undraw_docusaurus_react.svg').default,
     description: (
       <>
-        Extend or customize your website layout by reusing React. Docusaurus can
-        be extended while reusing the same header and footer.
+        Backend developers and future maintainers have a focused place to keep
+        current Wrapsfer API behavior aligned with the codebase.
       </>
     ),
   },
