@@ -5,4 +5,159 @@ sidebar_label: Configuration
 
 # Configuration
 
-_Stub page. Content will be authored in Phase 11._
+Every configuration source the Wrapsfer API reads today, every key it understands, and how to override each one without editing files.
+
+The application is built with `WebApplication.CreateBuilder(args)` and then composes configuration through `AddApplication()` and `AddInfrastructure(builder.Configuration)`. This page is grounded in `src/Wrapsfer.Api/appsettings.json`, `src/Wrapsfer.Api/appsettings.Development.json`, `src/Wrapsfer.Api/Program.cs`, and `src/Wrapsfer.Infrastructure/Options/AppOptions.cs`.
+
+## Configuration Sources And Load Order
+
+`WebApplication.CreateBuilder(args)` registers the standard ASP.NET Core configuration sources, in this order (later sources override earlier ones):
+
+1. `src/Wrapsfer.Api/appsettings.json` — base values, always loaded.
+2. `src/Wrapsfer.Api/appsettings.{Environment}.json` — only when present. The repo ships `appsettings.Development.json`; environment selection follows `ASPNETCORE_ENVIRONMENT` (default `Production` if unset).
+3. **User secrets** — loaded in `Development` only when a `UserSecretsId` is present in the project file. The current `Wrapsfer.Api.csproj` does **not** declare a `UserSecretsId`, so user secrets are inactive today.
+4. **Environment variables** — any variable. The double-underscore syntax (`Section__Key`) is used to reach nested keys.
+5. **Command-line arguments** — passed via `args` to `CreateBuilder`. The highest-priority source.
+
+The launch profiles in `src/Wrapsfer.Api/Properties/launchSettings.json` set `ASPNETCORE_ENVIRONMENT=Development`, and `docker-compose.yml` does the same. So both default local flows load `appsettings.Development.json`.
+
+## Configuration Keys
+
+### `App:Name`
+
+Bound to `Wrapsfer.Infrastructure.Options.AppOptions` (`SectionName = "App"`) via `services.Configure<AppOptions>(configuration.GetSection(AppOptions.SectionName))` in `AddInfrastructure`.
+
+| Key        | Type     | Default          | Source                          |
+| ---------- | -------- | ---------------- | ------------------------------- |
+| `App:Name` | `string` | `"Wrapsfer API"` | `appsettings.json`              |
+
+The default is set both as the JSON value in `appsettings.json` and as the C# initializer on `AppOptions.Name`. Nothing in the current codebase reads `IOptions<AppOptions>` yet — the binding exists for new code to consume.
+
+Override examples:
+
+```bash
+# environment variable
+App__Name="My API" dotnet run --project src/Wrapsfer.Api
+
+# command line
+dotnet run --project src/Wrapsfer.Api --App:Name="My API"
+```
+
+### `Cors:AllowedOrigins`
+
+Read directly in `Program.cs` when configuring the `DefaultCors` policy:
+
+```csharp
+var origins = builder.Configuration
+    .GetSection("Cors:AllowedOrigins")
+    .Get<string[]>();
+
+if (origins is { Length: > 0 })
+{
+    policy.WithOrigins(origins).AllowAnyHeader().AllowAnyMethod();
+}
+else
+{
+    policy.AllowAnyOrigin().AllowAnyHeader().AllowAnyMethod();
+}
+```
+
+| Key                      | Type       | Default              | Source              |
+| ------------------------ | ---------- | -------------------- | ------------------- |
+| `Cors:AllowedOrigins`    | `string[]` | `[]` (empty array)   | `appsettings.json`  |
+
+Behavior:
+
+- **Empty or missing** → policy falls back to `AllowAnyOrigin().AllowAnyHeader().AllowAnyMethod()`. Convenient for local development; **not appropriate for production** — see [CORS Security Note](#cors-security-note).
+- **At least one origin** → policy restricts to those origins, with any header and any method.
+
+Override examples (note the `__0`, `__1` array indices):
+
+```bash
+# single origin
+Cors__AllowedOrigins__0="https://app.example.com" \
+  dotnet run --project src/Wrapsfer.Api
+
+# multiple origins
+Cors__AllowedOrigins__0="https://app.example.com" \
+Cors__AllowedOrigins__1="https://admin.example.com" \
+  dotnet run --project src/Wrapsfer.Api
+
+# command line (uses : delimiters with array indexes)
+dotnet run --project src/Wrapsfer.Api \
+  --Cors:AllowedOrigins:0="https://app.example.com"
+```
+
+The pipeline applies the policy via `app.UseCors("DefaultCors")` for every request.
+
+### `Logging`
+
+Standard ASP.NET Core logging configuration. Both `appsettings.json` and `appsettings.Development.json` set the same values:
+
+| Key                                          | Type     | Default           |
+| -------------------------------------------- | -------- | ----------------- |
+| `Logging:LogLevel:Default`                   | `string` | `"Information"`   |
+| `Logging:LogLevel:Microsoft.AspNetCore`      | `string` | `"Warning"`       |
+
+No additional logging providers are wired in `Program.cs` beyond the defaults registered by `WebApplication.CreateBuilder` (Console, Debug, EventSource, EventLog on Windows). `ExceptionHandlingMiddleware` writes to `ILogger<ExceptionHandlingMiddleware>` using the standard logging pipeline.
+
+Override examples:
+
+```bash
+# raise the default log level for a single run
+Logging__LogLevel__Default="Debug" \
+  dotnet run --project src/Wrapsfer.Api
+
+# silence ASP.NET Core internal logs entirely
+Logging__LogLevel__Microsoft.AspNetCore="None" \
+  dotnet run --project src/Wrapsfer.Api
+```
+
+### `AllowedHosts`
+
+```json
+"AllowedHosts": "*"
+```
+
+| Key            | Type     | Default | Source              |
+| -------------- | -------- | ------- | ------------------- |
+| `AllowedHosts` | `string` | `"*"`   | `appsettings.json`  |
+
+Used by ASP.NET Core's host-filtering middleware to restrict the `Host` header values the server will accept. The default `"*"` allows any host. In production behind a known domain, set this to a semicolon-separated list of hostnames you serve, e.g. `"api.example.com;example.com"`.
+
+Override:
+
+```bash
+AllowedHosts="api.example.com" dotnet run --project src/Wrapsfer.Api
+```
+
+## Environment Variable Reference
+
+ASP.NET Core uses **double underscores** to represent nested keys in environment variables, and indexed underscores for arrays. Quick conversions for the keys above:
+
+| Configuration key                       | Environment variable                          |
+| --------------------------------------- | --------------------------------------------- |
+| `App:Name`                              | `App__Name`                                   |
+| `Cors:AllowedOrigins:0`                 | `Cors__AllowedOrigins__0`                     |
+| `Logging:LogLevel:Default`              | `Logging__LogLevel__Default`                  |
+| `Logging:LogLevel:Microsoft.AspNetCore` | `Logging__LogLevel__Microsoft.AspNetCore`     |
+| `AllowedHosts`                          | `AllowedHosts`                                |
+
+Two ASP.NET Core variables that affect the host (not in `appsettings.json` but commonly set):
+
+| Variable                  | Purpose                                                  |
+| ------------------------- | -------------------------------------------------------- |
+| `ASPNETCORE_ENVIRONMENT`  | Controls `app.Environment.IsDevelopment()` and which `appsettings.{Environment}.json` is loaded. Both default launch profiles and `docker-compose.yml` set this to `Development`. |
+| `ASPNETCORE_URLS`         | Overrides the bind URLs. The Compose service uses `http://+:8080`; see [Getting Started](../api/getting-started). |
+
+## CORS Security Note
+
+The empty-origins fallback (`AllowAnyOrigin`) is intentionally permissive so the boilerplate works out of the box during local development. **Do not deploy to production with `Cors:AllowedOrigins` empty.** Before promoting beyond local, set `Cors:AllowedOrigins` to the explicit list of origins that should be able to call the API — typically the front-end domain(s).
+
+If `AllowAnyOrigin` is used together with credentialed requests, browsers reject the response (CORS does not allow `*` with credentials). The current configuration does not enable credentials (`AllowCredentials()` is not called), so the policy is consistent — but it also means cookie/`Authorization`-bearing cross-origin requests will not work as-is. When credentials are introduced, switch to an explicit origin list and add `AllowCredentials()` at the same time.
+
+## See Also
+
+- [Architecture](./architecture) — where `AppOptions` lives and how Infrastructure binds it.
+- [Getting Started](../api/getting-started) — running the API locally with environment variables and Docker Compose.
+- [API Overview](../api/overview) — the `DefaultCors` policy as part of the request pipeline.
