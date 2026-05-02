@@ -22,8 +22,8 @@ const config: Config = {
 
   // GitHub pages deployment config.
   // If you aren't using GitHub pages, you don't need these.
-  organizationName: 'facebook', // Usually your GitHub org/user name.
-  projectName: 'docusaurus', // Usually your repo name.
+  organizationName: 'wrapsfer', // Usually your GitHub org/user name.
+  projectName: 'wiki', // Usually your repo name.
 
   onBrokenLinks: 'throw',
 
@@ -69,7 +69,7 @@ const config: Config = {
           type: 'docSidebar',
           sidebarId: 'docsSidebar',
           position: 'left',
-          label: 'Docs',
+          label: 'API Docs',
         },
         {
           href: 'https://github.com/wrapsfer/wiki',
@@ -85,7 +85,7 @@ const config: Config = {
           title: 'Docs',
           items: [
             {
-              label: 'Docs',
+              label: 'API Docs',
               to: '/docs/intro',
             },
           ],
