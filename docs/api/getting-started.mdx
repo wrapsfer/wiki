@@ -5,4 +5,118 @@ sidebar_label: Getting Started
 
 # Getting Started
 
-_Stub page. Content will be authored in Phase 6._
+Run the Wrapsfer API locally and verify it works.
+
+## Prerequisites
+
+- **.NET 10 SDK.** Required for `dotnet restore`, `dotnet build`, `dotnet run`, and `dotnet test`.
+- **Docker** (optional). Required only if you want to run the API via Docker Compose.
+
+Verify your .NET install:
+
+```bash
+dotnet --info
+```
+
+## Get The Source
+
+The API lives in its own repository, separate from this docs site. Clone it locally:
+
+```bash
+git clone <wrapsfer-api-repo-url>
+cd wrapsfer/api
+```
+
+All commands below are run from the API repository root.
+
+## Run From The .NET CLI
+
+Restore, build, and run the API:
+
+```bash
+dotnet restore
+dotnet build
+dotnet run --project src/Wrapsfer.Api
+```
+
+`dotnet run` honors `src/Wrapsfer.Api/Properties/launchSettings.json`. Two profiles are defined:
+
+| Profile | URLs                                            | Environment   |
+| ------- | ----------------------------------------------- | ------------- |
+| `http`  | `http://localhost:5167`                         | `Development` |
+| `https` | `https://localhost:7134` and `http://localhost:5167` | `Development` |
+
+`dotnet run` uses the **first** profile (`http`) by default. Pick a specific profile with `--launch-profile`:
+
+```bash
+dotnet run --project src/Wrapsfer.Api --launch-profile http
+dotnet run --project src/Wrapsfer.Api --launch-profile https
+```
+
+### Override The Local URL
+
+To bypass `launchSettings.json` and pick the URL explicitly, use `--no-launch-profile` together with `ASPNETCORE_URLS`:
+
+```bash
+ASPNETCORE_URLS=http://localhost:8080 dotnet run --project src/Wrapsfer.Api --no-launch-profile
+```
+
+This is useful when the launch-profile ports conflict with another local process, or when you want the API to listen on the same port as the Docker setup (8080).
+
+## Run With Docker Compose
+
+The repo ships a `Dockerfile` and `docker-compose.yml`. Compose builds the multi-stage image, runs the API in `Development`, and maps it to `http://localhost:8080`:
+
+```bash
+docker compose up --build
+```
+
+The compose service sets:
+
+- `ASPNETCORE_ENVIRONMENT=Development`
+- `ASPNETCORE_URLS=http://+:8080`
+- Port mapping `8080:8080`
+
+To run the image without Compose:
+
+```bash
+docker build -t wrapsfer-api .
+docker run --rm -p 8080:8080 -e ASPNETCORE_URLS=http://+:8080 wrapsfer-api
+```
+
+The Dockerfile's `EXPOSE` is `8080`. Pick `ASPNETCORE_URLS` and the published port to match.
+
+## Smoke Test
+
+Use whichever URL matches how you started the API.
+
+For the default `http` launch profile (`http://localhost:5167`):
+
+```bash
+curl http://localhost:5167/health
+curl "http://localhost:5167/api/greetings?name=Vernon"
+curl http://localhost:5167/openapi/v1.json
+```
+
+For Docker Compose (`http://localhost:8080`):
+
+```bash
+curl http://localhost:8080/health
+curl "http://localhost:8080/api/greetings?name=Vernon"
+curl http://localhost:8080/openapi/v1.json
+```
+
+Expected behavior:
+
+- `/health` returns `200` with the ASP.NET Core health-check body (`Healthy`).
+- `/api/greetings?name=Vernon` returns `200` with a JSON `GreetingResponse` (`Message` plus `GeneratedAt`). The `name` query parameter defaults to `"World"` and is validated as `[StringLength(80, MinimumLength = 1)]`.
+- `/openapi/v1.json` returns the OpenAPI document **only** in `Development` (it is mapped behind `app.Environment.IsDevelopment()`).
+
+For full request/response details, see the [Endpoint Reference](./endpoint-reference). For error and validation behavior, see [Errors & Validation](./errors-validation).
+
+## Where To Go Next
+
+- [API Overview](./overview) — what is and is not in the boilerplate.
+- [Endpoint Reference](./endpoint-reference) — request/response details.
+- [Configuration](../maintainers/configuration) — `appsettings.json`, environment variables, CORS, and app options.
+- [Development Workflow](../maintainers/development-workflow) — recommended flow for adding a feature.
