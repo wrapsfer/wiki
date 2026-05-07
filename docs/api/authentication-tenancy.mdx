@@ -1,0 +1,134 @@
+---
+title: Authentication & Tenancy
+sidebar_label: Authentication & Tenancy
+---
+
+# Authentication & Tenancy
+
+Every endpoint that lives under `ApiControllerBase` requires a valid Keycloak
+JWT bearer token, and every request is bound to a tenant realm before the
+handler runs.
+
+## Bearer Token
+
+`ApiControllerBase` is decorated with `[Authorize]`, so the bundled JWT
+bearer scheme is enforced on all derived controllers. Send the token as a
+standard `Authorization` header:
+
+```http
+GET /api/v1/products HTTP/1.1
+Host: tenant1.api.wrapsfer.example
+Authorization: Bearer <jwt>
+```
+
+Tokens are validated against the realm resolved for the current request
+(see below). The bearer scheme is configured in
+`Wrapsfer.Infrastructure.DependencyInjection.AddKeycloakAuthentication`:
+
+- `Authority` is initially set to `{Keycloak:BaseUrl}/realms/{Keycloak:OwnerRealm}`,
+  but the actual OpenID configuration used per request is fetched on demand
+  by `MultiTenantJwtBearerEvents` from the resolved realm's
+  `.well-known/openid-configuration` endpoint.
+- `Audience` is taken from `Keycloak:Audience` (default `wrapsfer-api`).
+- `RequireHttpsMetadata` defaults to `true` and should remain so in
+  production. Set it to `false` only for local Keycloak.
+- `MapInboundClaims = false` — the API consumes raw JWT claim names
+  (`sub`, `realm_access`, etc.).
+
+## Tenant Resolution
+
+Each request resolves a **tenant realm** before the controller action runs.
+The resolver is `SubdomainTenantRealmResolver`:
+
+1. If the request carries the `X-Tenant-Realm` header, use its value.
+2. Otherwise, parse the `Host` header. With three or more dot-separated
+   labels, the leading subdomain is used (e.g. `acme.api.wrapsfer.com` →
+   `acme`).
+3. If the host has fewer than three labels, or the leading subdomain is
+   `app`, fall back to `Keycloak:OwnerRealm`.
+
+The resolved realm is stored on `HttpContext.Items["TenantRealm"]` by
+`MultiTenantJwtBearerEvents.MessageReceived` and is what `JwtBearer` validates
+against.
+
+`HttpTenantContext` (registered as scoped `ITenantContext`) reads the realm
+from `HttpContext.Items` and exposes it as `TenantId`. It also surfaces
+`UserId` (from the `sub` claim) and `Roles` (parsed from the
+`realm_access.roles` JSON claim by `KeycloakClaimsTransformation`).
+
+## Owner Realm Behavior
+
+The tenant whose name matches `Keycloak:OwnerRealm` is the owner realm
+(default `owner`). It is reserved for staff that operate on behalf of partner
+tenants — owner users do not own resources directly.
+
+`TenantResolutionFilter` (a service filter applied to every business
+controller) enforces the rules:
+
+- An owner-realm caller **must** include a `tenantId` query parameter on
+  every request:
+
+  ```http
+  GET /api/v1/products?tenantId=acme HTTP/1.1
+  Authorization: Bearer <owner-jwt>
+  ```
+
+  Missing or empty `tenantId` → `400 Bad Request` with title
+  `"Tenant Required"`.
+
+- The `tenantId` value cannot equal the owner realm itself → `400` with
+  title `"Invalid Tenant"`.
+
+- When valid, the `tenantId` overwrites `HttpContext.Items["TenantRealm"]`,
+  so all downstream repository calls behave as if the request were issued by
+  the partner tenant.
+
+Non-owner callers ignore `tenantId` entirely; their realm is fixed by the
+header/subdomain.
+
+## `GET /api/v1/me`
+
+Returns the resolved identity for the current request:
+
+```bash
+curl -H "Authorization: Bearer $TOKEN" \
+     -H "X-Tenant-Realm: acme" \
+     https://api.wrapsfer.example/api/v1/me
+```
+
+```json
+{
+  "userId": "550e8400-e29b-41d4-a716-446655440000",
+  "tenantId": "acme",
+  "roles": ["user", "admin"]
+}
+```
+
+`MeController` is the only controller that bypasses
+`TenantResolutionFilter` — it relies on `[Authorize]` only and surfaces
+whatever realm was resolved.
+
+## Common Auth Errors
+
+The global exception handler classifies a few specific authentication
+failures and returns `application/problem+json`:
+
+| Status | Title                  | When                                                                                          |
+| ------ | ---------------------- | --------------------------------------------------------------------------------------------- |
+| `401`  | `Unauthorized`         | Missing or invalid bearer token (default `JwtBearer` 401 challenge).                          |
+| `401`  | `Authentication Error` | Tenant realm could not be resolved (`InvalidOperationException("Tenant realm has not been resolved.")`). |
+| `401`  | `Authentication Error` | User identity could not be determined (`InvalidOperationException("User is not authenticated.")`). |
+| `400`  | `Tenant Required`      | Owner-realm caller did not pass `tenantId`.                                                   |
+| `400`  | `Invalid Tenant`       | Owner-realm caller passed `tenantId` equal to the owner realm.                                |
+| `403`  | (default)              | Token valid but lacks required claim — handled by ASP.NET Core defaults.                      |
+
+All of these responses include a `traceId` extension; see
+[Errors & Validation](./errors-validation) for the full contract.
+
+## Roles
+
+Realm roles are parsed from the JWT's `realm_access.roles` array and mapped
+to standard `ClaimTypes.Role` claims by `KeycloakClaimsTransformation`. The
+codebase does not currently declare any `[Authorize(Roles = ...)]` attributes
+or named authorization policies — `[Authorize]` requires only an
+authenticated user.

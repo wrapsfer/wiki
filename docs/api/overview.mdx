@@ -5,114 +5,145 @@ sidebar_label: Overview
 
 # API Overview
 
-A high-level view of what the Wrapsfer API is **today**. It is a deliberately
-small .NET 10 Web API boilerplate organized around a Clean
-Architecture-style layout. This page documents what is implemented in the
-codebase and is explicit about what is intentionally not.
+A high-level view of the Wrapsfer API as implemented today: a tenant-aware
+.NET 10 Web API for catalogue, waybill, stock, and notification management.
 
 ## Purpose
 
-The Wrapsfer API exists as a reusable starting point for building a .NET Web
-API. It provides production-oriented foundations — health checks, OpenAPI in
-development, configuration binding, dependency injection, CORS, global
-exception handling, and a tested layering between HTTP, application, domain,
-and infrastructure code — without committing to authentication, a database,
-external integrations, or a particular cloud target.
+Wrapsfer exposes the operational surface of a logistics/warehouse partner:
 
-The only functional surface today is a **sample greeting endpoint** that
-demonstrates how a request flows through the controller, application service,
-and domain model.
+- A catalogue of **Products** (Single, Bundle, Package).
+- **Waybills** that move from Draft → Packed → HandedOff (or Cancelled),
+  with stock reserved on item add and consumed on hand-off.
+- **Tenant Settings** for the default low-stock threshold and notification
+  recipients.
+- **Stock Alert** history for low-stock and recovery events.
+- **Imports/exports** via CSV and XLSX, with exports delivered asynchronously
+  by email.
 
-## Current Stack
+Every endpoint that returns or mutates business data is scoped to the
+authenticated tenant.
 
-- **.NET 10** Web API (`net10.0`).
-- **ASP.NET Core controllers** (`AddControllers` + `[ApiController]`).
-- **OpenAPI** via `AddOpenApi` / `MapOpenApi`, exposed only when
-  `app.Environment.IsDevelopment()` is true.
-- **Health checks** via `AddHealthChecks` mapped to `/health`.
-- **Dependency injection** split by layer:
-  - `Wrapsfer.Application.DependencyInjection.AddApplication()` registers
-    application services (`IGreetingService` → `GreetingService`, scoped).
-  - `Wrapsfer.Infrastructure.DependencyInjection.AddInfrastructure(configuration)`
-    registers `TimeProvider.System` and binds `AppOptions` from configuration.
-- **Configuration** loaded from `appsettings.json`,
-  `appsettings.Development.json`, environment variables, and command-line
-  arguments. Bound sections: `App` (`AppOptions.Name`) and `Cors:AllowedOrigins`.
-- **CORS** through a single `DefaultCors` policy: if
-  `Cors:AllowedOrigins` contains entries, the policy restricts to those origins
-  with any header and any method; if the list is empty or missing, the policy
-  falls back to **allow any origin / header / method** (suitable for local
-  development, not for production).
-- **Middleware pipeline**: `ExceptionHandlingMiddleware` →
-  `UseHttpsRedirection` → `UseCors("DefaultCors")` → `UseAuthorization` →
-  health checks and controllers.
-- **Global exception handling** via `ExceptionHandlingMiddleware`: unhandled
-  exceptions are logged and returned as `application/problem+json` with
-  HTTP `500`.
-- **Validation** via ASP.NET Core model binding + `[ApiController]` and
-  data-annotation attributes (e.g. `[StringLength(80, MinimumLength = 1)]` on
-  the greeting `name` query string).
-- **Testing** with xUnit:
-  - `Wrapsfer.UnitTests` — domain/application unit tests.
-  - `Wrapsfer.IntegrationTests` — API tests using
-    `Microsoft.AspNetCore.Mvc.Testing.WebApplicationFactory<Program>`.
-- **Docker / Docker Compose** support via the project's `Dockerfile` and
-  `docker-compose.yml`. The container listens on port `8080`.
+## Stack
+
+- **.NET 10** Web API.
+- **ASP.NET Core controllers** with [API Versioning](https://github.com/dotnet/aspnet-api-versioning)
+  via URL segments (`api/v{version:apiVersion}/...`). Default version `1.0`.
+- **MediatR** for CQRS commands and queries.
+- **FluentValidation** with a `ValidationBehavior<TRequest, TResponse>`
+  pipeline that validates requests before they reach handlers.
+- **EF Core 10 + PostgreSQL** (Npgsql provider). `AuditableEntityInterceptor`,
+  `DomainEventInterceptor`, and `AuditLogInterceptor` are registered on the
+  `DbContext`.
+- **Keycloak JWT** authentication, with per-realm OIDC discovery and a
+  realm resolver driven by `X-Tenant-Realm` header / request subdomain.
+- **RabbitMQ** for async export workflows (`products.export`, `waybills.export`,
+  `wrapsfer.mail`) consumed by hosted services.
+- **Resend** for transactional email through FluentEmail; templates rendered
+  with [Fluid](https://github.com/sebastienros/fluid).
+- **Serilog** logging, configured from `appsettings.json`.
+- **Health checks** exposed at `/health`, aggregating the PostgreSQL and
+  RabbitMQ checks registered at startup.
+- **OpenAPI** via `Microsoft.AspNetCore.OpenApi`, mapped only when
+  `app.Environment.IsDevelopment()`.
+- **JSON enums** are serialized as strings (`JsonStringEnumConverter` is
+  globally registered).
 
 ## Solution Layout
 
 ```text
 src/
-  Wrapsfer.Api/             ASP.NET Core host, controllers, middleware, Program.cs
-  Wrapsfer.Application/     Use-case services and contracts (e.g. GreetingService)
-  Wrapsfer.Domain/          Domain models (e.g. Greeting)
-  Wrapsfer.Infrastructure/  Configuration options and infrastructure registrations
+  Wrapsfer.Api/             ASP.NET Core host, controllers, contracts, filters, exception handling
+  Wrapsfer.Application/     MediatR commands/queries, validators, behaviors, services
+  Wrapsfer.Domain/          Aggregates, domain events, repository interfaces, Result<T>/Error
+  Wrapsfer.Infrastructure/  EF Core, repositories, interceptors, Keycloak auth, RabbitMQ, jobs
+  Wrapsfer.Mailing/         Resend integration, Fluid templates, mail queue + consumer
 tests/
-  Wrapsfer.UnitTests/
+  Wrapsfer.Application.Tests/
+  Wrapsfer.Domain.Tests/
   Wrapsfer.IntegrationTests/
+  Wrapsfer.Mailing.Tests/
 ```
 
-Dependency direction: `Api` → (`Application`, `Infrastructure`),
+Dependency direction: `Api` → (`Application`, `Infrastructure`, `Mailing`),
 `Infrastructure` → (`Application`, `Domain`), `Application` → `Domain`,
-`Domain` → none.
+`Mailing` is independent of `Domain`/`Application`.
 
-## Endpoints (Summary)
+## Endpoint Summary
 
-| Method | Path                          | Auth | Notes                                        |
-| ------ | ----------------------------- | ---- | -------------------------------------------- |
-| `GET`  | `/health`                     | None | ASP.NET Core health checks endpoint.         |
-| `GET`  | `/api/greetings?name={name}`  | None | Sample endpoint. `name` defaults to `"World"`; validated `[StringLength(80, MinimumLength = 1)]`. |
-| `GET`  | `/openapi/v1.json`            | None | OpenAPI document. **Development only.**      |
+All resource controllers inherit from `ApiControllerBase`, which carries
+`[ApiController]`, `[Authorize]`, `[ApiVersion("1.0")]`, and the route
+prefix `api/v{version:apiVersion}/[controller]`. Modules under `/api/v1/...`
+are also wrapped by `TenantResolutionFilter` (which enforces the owner-realm
+`tenantId` query parameter requirement).
 
-Full request/response details live on the
-[Endpoint Reference](./endpoint-reference) page.
+| Module           | Endpoint                                                              | Notes                                              |
+| ---------------- | --------------------------------------------------------------------- | -------------------------------------------------- |
+| Me               | `GET /api/v1/me`                                                      | Returns `{userId, tenantId, roles}`.               |
+| Products         | `POST /api/v1/products`                                               | Create a product.                                  |
+|                  | `GET /api/v1/products`                                                | List with `search`, `type`, `page`, `pageSize`.    |
+|                  | `GET /api/v1/products/{id}`                                           | Get by ID.                                         |
+|                  | `GET /api/v1/products/by-barcode/{barcode}`                           | Get by tenant-scoped barcode.                      |
+|                  | `GET /api/v1/products/by-sku/{skuCode}`                               | Get by SKU code.                                   |
+|                  | `PUT /api/v1/products/{id}`                                           | Update (partial; supports clear flags).            |
+|                  | `DELETE /api/v1/products/{id}`                                        | Delete.                                            |
+|                  | `PATCH /api/v1/products/{id}/stock`                                   | Set absolute stock quantity.                       |
+|                  | `POST /api/v1/products/{id}/unpack`                                   | Unpack a Package into its target product.          |
+|                  | `POST /api/v1/products/import`                                        | CSV/XLSX upload, max 20 MB.                        |
+|                  | `POST /api/v1/products/export`                                        | Async export (RabbitMQ + email), `202 Accepted`.   |
+|                  | `GET /api/v1/products/import-template`                                | Sample CSV/XLSX with one row per product type.     |
+| Waybills         | `POST /api/v1/waybills`                                               | Create a draft waybill.                            |
+|                  | `GET /api/v1/waybills`                                                | List with `from`, `to`, `status`, `search`, paging. |
+|                  | `GET /api/v1/waybills/{id}`                                           | Get by ID.                                         |
+|                  | `GET /api/v1/waybills/by-date/{packagingDate}`                        | Waybills for a packaging date.                     |
+|                  | `GET /api/v1/waybills/number-available?waybillNumber=...`             | Tenant-scoped number availability.                 |
+|                  | `GET /api/v1/waybills/stale-drafts-report?hoursBack=48`               | Drafts older than `hoursBack`.                     |
+|                  | `PUT /api/v1/waybills/{id}`                                           | Update waybill number (Draft only).                |
+|                  | `DELETE /api/v1/waybills/{id}`                                        | Delete.                                            |
+|                  | `POST /api/v1/waybills/{id}/items`                                    | Add or increment a line item.                      |
+|                  | `PUT /api/v1/waybills/{id}/items/{itemId}`                            | Update item quantity.                              |
+|                  | `DELETE /api/v1/waybills/{id}/items/{itemId}`                         | Remove an item.                                    |
+|                  | `POST /api/v1/waybills/{id}/mark-packed`                              | Draft → Packed.                                    |
+|                  | `POST /api/v1/waybills/{id}/mark-handed-off`                          | Packed → HandedOff (creator-only).                 |
+|                  | `POST /api/v1/waybills/{id}/cancel`                                   | Cancel with reason (not from HandedOff).           |
+|                  | `POST /api/v1/waybills/export`                                        | Async export (RabbitMQ + email), `202 Accepted`.   |
+| Tenant Settings  | `GET /api/v1/tenant-settings`                                         | Read.                                              |
+|                  | `PUT /api/v1/tenant-settings`                                         | Upsert default low-stock threshold.                |
+|                  | `POST /api/v1/tenant-settings/recipients`                             | Add a notification recipient email.                |
+|                  | `DELETE /api/v1/tenant-settings/recipients/{id}`                      | Remove a recipient.                                |
+|                  | `PATCH /api/v1/tenant-settings/recipients/{id}`                       | Set recipient active/inactive.                     |
+| Stock Alerts     | `GET /api/v1/stock-alerts`                                            | Filter by `productId`, `alertType`, `from`, `to`.  |
+| Health           | `GET /health`                                                         | Aggregates Npgsql + RabbitMQ checks.               |
+| OpenAPI          | `GET /openapi/v1.json`                                                | Development only.                                  |
 
-## Not Implemented
+For per-endpoint contracts, see the module pages: [Products](./products),
+[Waybills](./waybills), [Tenant Settings](./tenant-settings),
+[Stock Alerts](./stock-alerts), and [Imports & Exports](./imports-exports).
 
-The following are intentionally omitted from the boilerplate. They are not
-present in the codebase today and should not be assumed by consumers.
+## Cross-Cutting Behaviors
 
-- **Authentication.** No authentication scheme is registered. The pipeline
-  calls `UseAuthorization`, but no authorization policies are defined and no
-  endpoints require authorization.
-- **Persistence.** No database, no EF Core, no repositories, no migrations.
-- **External integrations.** No third-party SDKs, message brokers, queues,
-  caches, or HTTP clients to external services.
-- **Production cloud setup.** No deployment manifests for any cloud
-  provider, no infrastructure-as-code, no production-grade CORS / TLS /
-  hosting configuration. The Docker setup targets local execution.
-- **Domain endpoints beyond the sample.** Only the greeting demonstrates the
-  layering; no business endpoints exist yet.
-- **Authorization policies.** The `UseAuthorization` middleware is wired in,
-  but there are no `[Authorize]` attributes or policy definitions in the
-  current code.
-
-When any of these are added, they should be documented as they land — not
-before.
+- **Result → HTTP mapping.** `ApiControllerBase.ToActionResult` /
+  `ToCreatedResult` map domain `Result<T>` outcomes:
+  `ErrorType.NotFound` → `404`, `Validation` → `400`, `Conflict` → `409`,
+  any other failure → `400`.
+- **ProblemDetails everywhere.** The global exception handler in
+  `Wrapsfer.Api.Extensions.WebApplicationExtensions.ConfigurePipeline` returns
+  `application/problem+json` and adds a `traceId` extension. Database errors
+  map to `503`, configuration errors to `503`, timeouts to `504`,
+  unexpected to `500`.
+- **Validation extensions.** Model-state validation failures emit a
+  `ProblemDetails` with an `errors` extension (field → messages) and a
+  `traceId`.
+- **Audit logging.** Every non-`AuditLog` insert/update/delete is recorded
+  in `audit_logs` by `AuditLogInterceptor`, redacting properties marked
+  `[SensitiveData]`.
+- **Domain events.** Aggregates raise events (e.g. `LowStockDetectedEvent`)
+  and `DomainEventInterceptor` publishes them via MediatR after `SaveChanges`.
 
 ## Where To Go Next
 
-- [Getting Started](./getting-started) — run the API locally and call an endpoint.
-- [Endpoint Reference](./endpoint-reference) — request/response details.
-- [Errors & Validation](./errors-validation) — error contract and validation behavior.
-- [Configuration](../maintainers/configuration) — `appsettings.json`, environment variables, CORS, and app options.
+- [Getting Started](./getting-started) — run the API locally.
+- [Authentication & Tenancy](./authentication-tenancy) — JWT, realms, headers.
+- [Errors & Validation](./errors-validation) — the `ProblemDetails` contract.
+- [OpenAPI](./openapi) — the generated document and how to consume it.
+- [Architecture](../maintainers/architecture) — internals for maintainers.

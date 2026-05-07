@@ -5,131 +5,202 @@ sidebar_label: Architecture
 
 # Architecture
 
-The Wrapsfer API uses a small Clean Architecture-style layout: four projects under `src/` with strictly inward-pointing dependencies, and two test projects under `tests/`. This page describes the layout that exists today and where future code should live.
+Wrapsfer follows Clean Architecture with CQRS. Five projects under `src/`,
+inward-pointing dependencies, no inversions. New behavior is added module
+by module — Products and Waybills are the two reference modules.
 
 ## Project Layout
 
 ```text
 src/
-  Wrapsfer.Api/
-    Controllers/             HTTP endpoints
-    Middleware/              Request pipeline middleware
-    Properties/              launchSettings.json
-    Program.cs               Application startup and pipeline configuration
-    appsettings.json         Base configuration
-    appsettings.Development.json
-    Wrapsfer.Api.csproj      Microsoft.NET.Sdk.Web
-
-  Wrapsfer.Application/
-    Greetings/               Sample application service and contract
-                             (IGreetingService, GreetingService, GreetingResponse)
-    DependencyInjection.cs   AddApplication() service registrations
-
-  Wrapsfer.Domain/
-    Greetings/               Sample domain model (Greeting)
-
-  Wrapsfer.Infrastructure/
-    Options/                 Configuration-bound options (AppOptions)
-    DependencyInjection.cs   AddInfrastructure(IConfiguration) registrations
-
+  Wrapsfer.Api/                ASP.NET Core host
+    Controllers/V1/            ProductsController, WaybillsController, ...
+    Contracts/                 Request DTOs that map onto MediatR commands
+    Filters/TenantResolutionFilter.cs
+    Extensions/                ServiceCollectionExtensions, WebApplicationExtensions
+  Wrapsfer.Application/        MediatR-driven use cases
+    Abstractions/              ITenantContext, ICommand/IQuery, file processing, queue
+    Behaviors/                 ValidationBehavior, LoggingBehavior, RequestLoggingSanitizer
+    Common/                    PagedResult<T>
+    Products/, Waybills/, TenantSettings/, StockAlerts/
+                               Commands/, Queries/, EventHandlers/, Messaging/, Responses/
+  Wrapsfer.Domain/             Aggregates and domain primitives
+    Abstractions/              IUnitOfWork, IDomainEventHandler, DomainEventNotification<T>
+    Common/                    Result, Result<T>, Error, ErrorType, BaseEntity, AuditableEntity, AuditLog
+    Entities/                  Product, ProductComponent, Waybill, WaybillItem, TenantSettings, ...
+    Enums/                     ProductType, WaybillStatus, StockAlertType, StockAlertDeliveryStatus
+    Errors/                    Per-aggregate static error catalogues
+    Events/                    Domain events (LowStockDetected, WaybillPacked, ...)
+    Repositories/              Repository interfaces
+  Wrapsfer.Infrastructure/     Concrete adapters
+    Authentication/            Keycloak realm resolution + JWT events
+    BackgroundServices/        Hosted services (export consumers, stale-draft job)
+    Configuration/             Infisical secrets provider + options
+    FileProcessing/            CSV/XLSX parsers and writers
+    Migrations/                EF Core migrations + ApplicationDbContextModelSnapshot
+    Persistence/               ApplicationDbContext, Configurations, Interceptors, Repositories
+    Queue/                     RabbitMqMessagePublisher + queue extensions
+  Wrapsfer.Mailing/            Email subsystem (independent module)
+    Abstractions/              IMailer, MailMessage, MailRequestId
+    Queue/                     RabbitMqMailer (publisher) + MailProcessingConsumer
+    Resend/                    FluentEmailMailSender + ResendOptions
+    Templates/                 ITemplateRenderer (Fluid) + Templates/Files/{...}
 tests/
-  Wrapsfer.UnitTests/        Fast tests for domain/application behavior
-  Wrapsfer.IntegrationTests/ API-level tests using WebApplicationFactory<Program>
+  Wrapsfer.Application.Tests/  Handler/validator unit tests
+  Wrapsfer.Domain.Tests/       Entity invariants
+  Wrapsfer.Mailing.Tests/      Template + queue tests
+  Wrapsfer.IntegrationTests/   WebApplicationFactory-based tests
 ```
-
-The solution file is `Wrapsfer.slnx` at the repo root.
 
 ## Dependency Direction
 
-Project references (verified in each `.csproj`):
-
-| Project                     | References                                  |
-| --------------------------- | ------------------------------------------- |
-| `Wrapsfer.Api`              | `Wrapsfer.Application`, `Wrapsfer.Infrastructure` |
-| `Wrapsfer.Infrastructure`   | `Wrapsfer.Application`, `Wrapsfer.Domain`   |
-| `Wrapsfer.Application`      | `Wrapsfer.Domain`                           |
-| `Wrapsfer.Domain`           | *(none)*                                    |
-| `Wrapsfer.UnitTests`        | `Wrapsfer.Application`, `Wrapsfer.Domain`   |
-| `Wrapsfer.IntegrationTests` | `Wrapsfer.Api`                              |
-
-Visual summary:
-
 ```text
-Api  ─►  Application  ─►  Domain
- │           ▲              ▲
- ▼           │              │
-Infrastructure ──────────────┘
+Api ──► Application ──► Domain
+ │           ▲             ▲
+ ▼           │             │
+Infrastructure ────────────┘
+ ▲
+ │
+Mailing  (independent of Domain/Application)
 ```
 
-Dependencies always point **inward**: Domain depends on nothing; Application depends only on Domain; Infrastructure depends on Application and Domain; Api composes everything. There are no outward references and Domain has zero project or framework references that would tie it to ASP.NET Core, configuration, DI extensions, EF Core, etc.
+- `Api` is the composition root and references `Application`, `Infrastructure`,
+  and `Mailing`.
+- `Infrastructure` depends on `Application` (abstractions like
+  `ITenantContext`, `IUnitOfWork`) and `Domain`.
+- `Application` depends only on `Domain`.
+- `Mailing` is a standalone module — no `Domain`/`Application` references —
+  so it can be reused by any caller.
+- `Domain` has no project references.
 
-## Layer Responsibilities
+## CQRS With MediatR
 
-### `Wrapsfer.Domain`
+Every use case is a `MediatR.IRequest<TResponse>`:
 
-The innermost layer. Contains domain models and rules that are independent of frameworks, persistence, and HTTP.
+- **Commands** implement `ICommand<TResponse>` (or `ICommand` for void
+  outcomes) and return `Result<T>` / `Result`. Examples:
+  `CreateProductCommand`, `MarkWaybillPackedCommand`.
+- **Queries** implement `IQuery<TResponse>` and return
+  `Result<TResponse>`. Examples: `GetProductByIdQuery`,
+  `ListWaybillsQuery`.
+- **Handlers** implement `ICommandHandler<TCommand, TResponse>` /
+  `IQueryHandler<TQuery, TResponse>` and live next to the request type
+  (`Application/Products/Commands/CreateProduct/CreateProductCommandHandler.cs`).
 
-- Today: the `Greeting` record (validates `name` is non-empty, exposes `Message`).
-- Has **no** project or NuGet references — `Wrapsfer.Domain.csproj` only sets target framework, nullable, and implicit usings.
-- New domain rules and invariants belong here, expressed as types and methods that can be unit-tested without any framework setup.
+Controllers are thin: they construct the command from the HTTP body, send
+it through `ISender`, and pipe the resulting `Result` through
+`ApiControllerBase.ToActionResult` / `ToCreatedResult`.
 
-### `Wrapsfer.Application`
+### Pipeline Behaviors
 
-Use cases, contracts, and application-level orchestration. Talks to Domain; abstracts away from HTTP and infrastructure.
+`Wrapsfer.Application` registers two MediatR pipeline behaviors
+(in `Application/DependencyInjection.cs`):
 
-- Today: `IGreetingService` / `GreetingService` and the `GreetingResponse` DTO; `DependencyInjection.AddApplication()` registers `IGreetingService` as `Scoped`.
-- References Domain only (`ProjectReference` to `Wrapsfer.Domain`); pulls in `Microsoft.Extensions.DependencyInjection.Abstractions` so it can expose its own `AddApplication()` extension.
-- New use-case interfaces and services belong here. Application code may depend on abstractions for infrastructure concerns (e.g. clocks, repositories) but should not reference concrete infrastructure types.
+1. **`ValidationBehavior<TRequest, TResponse>`** — runs all registered
+   FluentValidation validators for the request type before the handler.
+   Aggregated failures return as `ErrorType.Validation` `Result`s.
+2. **`LoggingBehavior<TRequest, TResponse>`** — structured request/response
+   logs through Serilog. `RequestLoggingSanitizer` redacts properties
+   marked `[SensitiveData]`.
 
-### `Wrapsfer.Infrastructure`
+## Result Pattern
 
-Concrete adapters and configuration binding. Provides implementations for things the Application layer abstracts.
+Domain methods that can fail return `Result<T>` (`Wrapsfer.Domain.Common`).
+`Error` is a value object: `Code`, `Description`, `Type` (`Validation`,
+`NotFound`, `Conflict`, `Failure`). Errors are declared as `static readonly`
+fields on per-aggregate error catalogues — e.g. `ProductErrors.NotFound`,
+`WaybillErrors.CannotEditNonDraft`. **No inline `new Error(...)`.**
 
-- Today: `Options/AppOptions` (`SectionName = "App"`, `Name = "Wrapsfer API"`); `DependencyInjection.AddInfrastructure(IConfiguration)` registers `TimeProvider.System` as a singleton and binds `AppOptions` from the `App` configuration section.
-- References `Wrapsfer.Application` and `Wrapsfer.Domain`; pulls in `Microsoft.Extensions.Options.ConfigurationExtensions` for `Configure<T>(IConfigurationSection)`.
-- Persistence, external HTTP clients, message brokers, file system access, and other I/O-heavy adapters belong here when they are added.
+`ApiControllerBase` maps `Error.Type` to HTTP status codes; see
+[Errors & Validation](../api/errors-validation).
 
-### `Wrapsfer.Api`
+## Domain Events
 
-The composition root and HTTP surface. Wires everything together and exposes endpoints.
+Aggregates raise events by appending to `BaseEntity.DomainEvents`. Examples:
 
-- Today: `Program.cs` registers controllers, OpenAPI, health checks, CORS, then calls `AddApplication()` and `AddInfrastructure(builder.Configuration)`; the pipeline is `ExceptionHandlingMiddleware` → `UseHttpsRedirection` → `UseCors("DefaultCors")` → `UseAuthorization` → health checks + controllers; OpenAPI is mapped only in `Development`.
-- `Controllers/GreetingsController` is the only controller today; `Middleware/ExceptionHandlingMiddleware` returns `application/problem+json` 500 for unhandled exceptions.
-- References `Application` and `Infrastructure`; uses `Microsoft.NET.Sdk.Web` and `Microsoft.AspNetCore.OpenApi`.
-- New HTTP endpoints, request/response shapes specific to HTTP, middleware, and pipeline configuration belong here.
+- `LowStockDetectedEvent` / `StockRecoveredEvent` (Product).
+- `WaybillCreatedEvent`, `WaybillPackedEvent`, `WaybillHandedOffEvent`,
+  `WaybillCancelledEvent`, `WaybillItemAddedEvent` (Waybill).
 
-### Tests
+`DomainEventInterceptor` (registered as a `SaveChangesInterceptor`)
+collects every event from tracked entities after a successful
+`SaveChangesAsync`, wraps each in `DomainEventNotification<T>`, and
+publishes it through MediatR. Handlers (`IDomainEventHandler<TEvent>` →
+`INotificationHandler<DomainEventNotification<TEvent>>`) live in
+`Application/{Module}/EventHandlers/`. Events are cleared from the
+entities after publication.
 
-- `Wrapsfer.UnitTests` references `Application` and `Domain`. Use it for fast tests of domain rules and application services that do not need an HTTP host.
-- `Wrapsfer.IntegrationTests` references `Api` and uses `Microsoft.AspNetCore.Mvc.Testing.WebApplicationFactory<Program>` to spin up the in-memory host. Use it for endpoint behavior — status codes, headers, response bodies.
+This makes side effects (alert emails, logs, downstream messaging) fire
+**after** the database transaction commits.
 
-## Where To Add New Behavior
+## EF Core Persistence
 
-A typical feature flows from inside out:
+`ApplicationDbContext` (in `Wrapsfer.Infrastructure.Persistence`) exposes
+DbSets for `Product`, `ProductComponent`, `TenantSettings`,
+`NotificationRecipient`, `StockAlertLog`, `Waybill`, `WaybillItem`, and
+`AuditLog`. It also implements `IUnitOfWork` (the `Wrapsfer.Domain`
+abstraction).
 
-1. **Express the rule in `Wrapsfer.Domain`.** Add the type, invariants, and behavior as plain C#. No framework references.
-2. **Define the use case in `Wrapsfer.Application`.** Add an interface plus an implementation that orchestrates Domain. Register it in `AddApplication()`. If the use case needs an external dependency (clock, repository, HTTP client), depend on an abstraction defined in Application.
-3. **Provide the adapter in `Wrapsfer.Infrastructure`** *only if needed*. Implement the abstraction and register it in `AddInfrastructure(IConfiguration)`. Bind any new `appsettings` section through `Configure<T>`.
-4. **Expose the behavior in `Wrapsfer.Api`.** Add a controller (or extend an existing one) that calls the application service. Keep request/response shapes specific to HTTP in this layer; let the application return its own DTOs.
-5. **Add unit tests in `Wrapsfer.UnitTests`** for domain and application behavior.
-6. **Add integration tests in `Wrapsfer.IntegrationTests`** for the HTTP behavior using `WebApplicationFactory<Program>`.
+Per-entity configuration lives in
+`Infrastructure/Persistence/Configurations/*Configuration.cs`. Tenant
+isolation is enforced as a code rule — every repository method takes a
+`tenantId` and filters by it; the `(tenantId, key)` indexes back this
+up. Concurrency tokens use PostgreSQL's `xmin` system column where
+needed (e.g. stock fields).
 
-### Things To Keep Out Of Domain
+### Interceptors
 
-- ASP.NET Core types (`HttpContext`, `IActionResult`, `ControllerBase`, attributes like `[FromQuery]`).
-- Configuration / DI types (`IConfiguration`, `IServiceCollection`, `IOptions<T>`).
-- Persistence concerns (EF Core entities, `DbContext`, repository implementations).
-- Logging and telemetry frameworks.
+Three `SaveChangesInterceptor`s are attached to the `DbContext`:
 
-If a domain operation needs the current time, an external service, or persistence, express the dependency as an abstraction owned by Domain or Application and implement it in Infrastructure. The current code follows this rule (e.g. `GreetingService` takes `TimeProvider` from DI rather than calling `DateTimeOffset.UtcNow` directly).
+| Interceptor                  | Hook        | Purpose                                                                |
+| ---------------------------- | ----------- | ---------------------------------------------------------------------- |
+| `AuditableEntityInterceptor` | SavingChanges | Sets `CreatedAt/By` and `UpdatedAt/By` on every `AuditableEntity`.   |
+| `AuditLogInterceptor`        | SavingChanges | Appends an `AuditLog` row per Add/Update/Delete (excluding `AuditLog` itself). Redacts `[SensitiveData]` properties. |
+| `DomainEventInterceptor`     | SavedChangesAsync | Publishes domain events through MediatR after a successful save. |
 
-### Things To Keep Out Of Application
+`AuditableEntityInterceptor` and `AuditLogInterceptor` use `ITenantContext`
+to capture the acting user/tenant; both swallow access errors so background
+services without an HTTP scope still save successfully.
 
-- HTTP-specific types and attributes.
-- Concrete infrastructure (database connections, file system access, third-party SDKs). Reference abstractions instead and let Infrastructure implement them.
+## Repository Pattern
+
+Repository interfaces live in `Wrapsfer.Domain.Repositories`; concrete
+implementations are in `Wrapsfer.Infrastructure.Persistence.Repositories`:
+
+- `IProductRepository`, `IProductComponentRepository`,
+  `ITenantSettingsRepository`, `IStockAlertLogRepository`,
+  `IWaybillRepository`.
+
+Every read/mutate method requires `tenantId`. Repositories project to
+domain types — they do not expose `IQueryable` upward. Batch operations
+(`GetByIdsAsync`, `GetByBarcodesAsync`) exist to avoid N+1 fetches in
+imports and the stock reservation service.
+
+## Adding A Module
+
+The Products module is the canonical reference. To add a new module:
+
+1. **Domain** — entity (aggregate root) in `Domain/Entities/`, error
+   catalogue in `Domain/Errors/`, repository interface in
+   `Domain/Repositories/`, domain events in `Domain/Events/`.
+2. **Application** — `Commands/` and `Queries/` folders with
+   `Command/Query`, `Handler`, and `Validator` per use case. Response
+   DTOs in `{Module}/Responses/`. Domain event handlers in
+   `{Module}/EventHandlers/`.
+3. **Infrastructure** — repository implementation and EF configuration in
+   `Persistence/`. Register the repository in
+   `Infrastructure.DependencyInjection.AddInfrastructure`.
+4. **Api** — controller in `Controllers/V1/`. Apply
+   `[ServiceFilter(typeof(TenantResolutionFilter))]` if owner-realm
+   override should apply. Inherit `ApiControllerBase` for `[Authorize]`
+   + result mapping. Request DTOs in `Contracts/`.
+5. Add tests across `Wrapsfer.Domain.Tests`,
+   `Wrapsfer.Application.Tests`, and `Wrapsfer.IntegrationTests`.
 
 ## See Also
 
-- [Configuration](./configuration) — how `AppOptions`, CORS, and other settings are bound.
-- [Testing](./testing) — what `Wrapsfer.UnitTests` and `Wrapsfer.IntegrationTests` cover.
-- [Development Workflow](./development-workflow) — recommended flow for adding a feature, end to end.
+- [Configuration](./configuration) — what each `appsettings` section binds to.
+- [Database & Migrations](./database-migrations) — EF Core CLI and design-time factory.
+- [Messaging & Background Jobs](./messaging-background-jobs) — RabbitMQ, consumers, and the stale-draft job.
+- [Mailing](./mailing) — Resend + Fluid templates.
+- [Authentication Internals](./authentication-internals) — JWT events, realm cache, claims transformation.

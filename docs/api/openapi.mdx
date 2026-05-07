@@ -5,25 +5,39 @@ sidebar_label: OpenAPI
 
 # OpenAPI Specification
 
-The Wrapsfer API exposes a generated OpenAPI document via `Microsoft.AspNetCore.OpenApi`. The document is registered for every environment but only **mapped** in `Development`, so it is reachable on local and Compose runs but not from a production deployment.
+The Wrapsfer API ships a generated OpenAPI document via
+`Microsoft.AspNetCore.OpenApi`. The endpoint is gated behind
+`Development` so it is reachable on local and Compose flows but not on a
+production deployment.
 
 ## How It Is Wired
 
-In `src/Wrapsfer.Api/Program.cs`:
+In `src/Wrapsfer.Api/Extensions/ServiceCollectionExtensions.cs`:
 
 ```csharp
 builder.Services.AddOpenApi();
-// …
+```
+
+In `src/Wrapsfer.Api/Extensions/WebApplicationExtensions.cs`:
+
+```csharp
 if (app.Environment.IsDevelopment())
 {
     app.MapOpenApi();
 }
 ```
 
-- **`AddOpenApi()`** registers the OpenAPI document generator in the DI container. The package is `Microsoft.AspNetCore.OpenApi 10.0.7` (declared in `Wrapsfer.Api.csproj`).
-- **`MapOpenApi()`** adds the HTTP endpoint that serves the generated document. The call sits inside `if (app.Environment.IsDevelopment())`, so the endpoint is only routed when `ASPNETCORE_ENVIRONMENT=Development`.
+- **`AddOpenApi()`** registers the OpenAPI document generator and the
+  versioned API explorer (because `AddApiVersioning().AddApiExplorer(...)`
+  also runs at startup, with `SubstituteApiVersionInUrl = true`).
+- **`MapOpenApi()`** adds the HTTP endpoint that serves the document.
+  Only mapped when `ASPNETCORE_ENVIRONMENT=Development`.
 
-No additional configuration is supplied — there is no custom document title, version, server, or security scheme today. The output is whatever `Microsoft.AspNetCore.OpenApi` produces from the registered controllers, which today means just the greeting endpoint.
+No custom document title, version, server, or security scheme is wired
+in source today. The output reflects whatever the API
+versioning + OpenAPI integration produces from the registered
+controllers — which means, currently, the v1 surface for `me`,
+`products`, `waybills`, `tenant-settings`, and `stock-alerts`.
 
 ## The Endpoint
 
@@ -34,41 +48,69 @@ No additional configuration is supplied — there is no custom document title, v
 In `Development`:
 
 ```bash
-curl -i http://localhost:8080/openapi/v1.json
+curl -i http://localhost:5222/openapi/v1.json
 ```
 
-Returns `200 OK` with `Content-Type: application/json` containing the OpenAPI v1 document. The path is the package's default for the unnamed document (`v1`); it is not customized in source.
+Returns `200 OK` with `Content-Type: application/json` containing the
+OpenAPI v1 document. Outside `Development`, the route is not mapped and
+returns `404 Not Found`.
 
-In any other environment the route is not mapped and requests return `404 Not Found` from ASP.NET Core's endpoint router.
-
-The default launch profiles in `src/Wrapsfer.Api/Properties/launchSettings.json` set `ASPNETCORE_ENVIRONMENT=Development`, and `docker-compose.yml` does the same. So the endpoint is reachable in both default local flows. See [Getting Started](./getting-started) for the URL that matches your launch method.
+The default launch profiles in
+`src/Wrapsfer.Api/Properties/launchSettings.json` set
+`ASPNETCORE_ENVIRONMENT=Development`, so the endpoint is reachable in
+both `http` and `https` local profiles.
 
 ## Common Uses
 
-Once you have the document, typical workflows include:
+- **Endpoint discovery.** Render the document with Swagger UI, Redoc,
+  or an IDE HTTP client to browse routes and try requests.
+- **Client generation.** Feed the document to a generator
+  (`openapi-generator`, `Kiota`, `NSwag`) to produce typed clients
+  in TypeScript, C#, Python, etc.
+- **Contract checks.** Diff successive versions in CI to surface
+  breaking changes to the public surface.
+- **Bruno collection seed.** Use the document to scaffold or update
+  the request collection that ships under `bruno/` in the API repo.
 
-- **Endpoint discovery.** Read or render the document to see every route, parameter, and response shape exposed by the API.
-- **API exploration tools.** Point a renderer such as Swagger UI, Redoc, or your IDE's HTTP client at `/openapi/v1.json` to browse and try requests interactively.
-- **Client generation.** Run a generator (for example `openapi-generator`, `Kiota`, or `NSwag`) against the document to produce typed clients in TypeScript, C#, Python, and so on.
-- **Contract checks.** Diff successive versions of the document in CI to surface breaking changes to the public surface.
+## What The Document Does Not Capture
 
-These are uses you can apply to the generated document — none of them are wired into the repository today.
+A few behaviors are encoded outside controller signatures and therefore
+do not appear directly in the schema:
+
+- **Owner-realm `tenantId` query.** Enforced by `TenantResolutionFilter`,
+  not by an explicit `[FromQuery]` parameter on each action — see
+  [Authentication & Tenancy](./authentication-tenancy).
+- **Authentication.** The bearer requirement comes from `[Authorize]`
+  on `ApiControllerBase`. No security scheme is configured in the
+  OpenAPI document today; clients must add the `Authorization` header
+  manually.
+- **Per-`Result` error mappings.** The HTTP status codes returned
+  by `ToActionResult` (`200`/`201`/`204` on success; `400`/`404`/`409`
+  on failure) are not declared via `[ProducesResponseType]` per action —
+  see [Errors & Validation](./errors-validation) for the full contract.
 
 ## Production Exposure
 
-OpenAPI is **not** exposed outside `Development` unless `Program.cs` is intentionally changed. The current code gates `MapOpenApi()` behind `IsDevelopment()`, so promoting the API to `Staging` or `Production` (by setting `ASPNETCORE_ENVIRONMENT` accordingly) silently removes the endpoint without any further configuration.
+OpenAPI is **not** exposed outside `Development` unless
+`WebApplicationExtensions.ConfigurePipeline` is intentionally changed.
+Promoting to `Staging` or `Production` (by setting
+`ASPNETCORE_ENVIRONMENT` accordingly) silently removes the endpoint.
 
-If exposing the document beyond local is desired later, the change should be deliberate and considered alongside:
+If exposing it beyond local becomes desirable, decide alongside:
 
-- whether the document should be served behind authentication,
-- whether to publish a static, versioned copy artifact rather than a live endpoint,
-- whether to restrict CORS / network access to the route.
+- whether the document should sit behind authentication,
+- whether to publish a static, versioned artifact instead of a live
+  endpoint,
+- whether to restrict CORS / network access to the route,
+- whether to add `[ProducesResponseType]` and security scheme metadata
+  to make the document self-describing.
 
-Until that decision is made, treat the absence of `/openapi/v1.json` outside `Development` as the intended behavior.
+Until that decision is made, treat the absence of `/openapi/v1.json`
+outside `Development` as intentional.
 
 ## See Also
 
-- [Endpoint Reference](./endpoint-reference) — `/openapi/v1.json` listed alongside the other endpoints.
-- [API Overview](./overview) — OpenAPI listed under the current stack and dev-only availability.
-- [Getting Started](./getting-started) — how to reach the local URL that hosts the document.
-- [Configuration](../maintainers/configuration) — `ASPNETCORE_ENVIRONMENT` and other host-level settings that determine whether the endpoint is mapped.
+- [API Overview](./overview) — endpoint summary table.
+- [Getting Started](./getting-started) — how to reach the local URL.
+- [Authentication & Tenancy](./authentication-tenancy) — auth details that the document does not capture.
+- [Errors & Validation](./errors-validation) — error contract that the document does not declare.

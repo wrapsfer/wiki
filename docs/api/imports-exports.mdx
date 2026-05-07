@@ -1,0 +1,191 @@
+---
+title: Imports & Exports
+sidebar_label: Imports & Exports
+---
+
+# Imports & Exports
+
+The Products and Waybills modules support **CSV** and **XLSX** file
+exchanges. Imports are synchronous and tenant-scoped; exports are
+asynchronous and delivered by email.
+
+`ProductFileFormat`:
+
+| Value  | Notes                                                              |
+| ------ | ------------------------------------------------------------------ |
+| `Csv`  | Plain CSV. Used for both products and waybills exports.            |
+| `Xlsx` | Microsoft Excel `.xlsx` (`spreadsheetml.sheet`). Same use cases.   |
+
+The format enum is shared because the file pipeline (`IProductFileParser`,
+`IProductFileWriter`) is generic — composite parsers/writers dispatch to
+CSV or XLSX implementations under the hood.
+
+## Common Upload Constraints
+
+For `POST /api/v1/products/import`:
+
+- **Max upload size: 20 MB** (`MaxImportBytes = 20L * 1024 * 1024`).
+  Enforced by `[RequestSizeLimit]`, `[RequestFormLimits]`, and a length
+  check in the controller.
+- **Required**: `IFormFile` is required. Missing or empty file →
+  `ProductImport.FileRequired` (`400`).
+- **Allowed content types**:
+
+  | `format` | Accepted `Content-Type` values                                                          |
+  | -------- | --------------------------------------------------------------------------------------- |
+  | `Csv`    | `text/csv`, `application/csv`, `text/plain`                                             |
+  | `Xlsx`   | `application/vnd.openxmlformats-officedocument.spreadsheetml.sheet`, `application/vnd.ms-excel` |
+
+  Anything else → `ProductImport.UnsupportedFormat` (`400`).
+
+## Products Import
+
+```http
+POST /api/v1/products/import?format=Csv
+Authorization: Bearer <jwt>
+Content-Type: multipart/form-data; boundary=...
+
+------BoundaryXYZ
+Content-Disposition: form-data; name="file"; filename="catalogue.csv"
+Content-Type: text/csv
+
+barcode,name,skuCode,type,cost,stockQuantity,lowStockThreshold,unpackTargetBarcode,unpackQuantityPerPackage,components
+4900000000001,Widget,SKU-1,Single,9.99,100,10,,,
+4900000000002,Widget Bundle,SKU-2,Bundle,24.99,0,,,,4900000000001:2;4900000000003:1
+4900000000004,Widget Pack,SKU-3,Package,49.99,20,5,4900000000001,12,
+------BoundaryXYZ--
+```
+
+### Columns
+
+`ProductFileColumns.AllInOrder` is the canonical column order:
+
+`barcode, name, skuCode, type, cost, stockQuantity, lowStockThreshold,
+unpackTargetBarcode, unpackQuantityPerPackage, components`
+
+### Per-Type Required Fields
+
+- **Single** — `barcode`, `name`, `type=Single`, `cost`, `stockQuantity`.
+- **Bundle** — `barcode`, `name`, `type=Bundle`, `cost`, `stockQuantity`
+  (typically `0`), and a non-empty `components` list.
+- **Package** — `barcode`, `name`, `type=Package`, `cost`,
+  `stockQuantity`, plus `unpackTargetBarcode` and a positive
+  `unpackQuantityPerPackage`.
+
+### `components` Format
+
+A semicolon-separated list of `barcode:quantity` pairs:
+
+```text
+4900000000001:2;4900000000003:1
+```
+
+Constraints applied by the importer:
+
+- Quantity must be `> 0`.
+- No duplicate child barcodes within a row.
+- Each child must be a `Single` (existing or being created in the same
+  file) — Bundles cannot nest, and Packages cannot be components.
+- A Package's `unpackTargetBarcode` must also resolve to a `Single` and
+  cannot reference itself.
+
+### Response
+
+`200 OK` with `ProductImportResult`:
+
+```json
+{
+  "totalRows": 3,
+  "createdCount": 2,
+  "updatedCount": 1,
+  "errors": []
+}
+```
+
+When any row-level errors are detected, the importer **does not commit**.
+The response is still `200 OK`, but `createdCount` and `updatedCount` are
+`0` and `errors` lists each problem:
+
+```json
+{
+  "totalRows": 3,
+  "createdCount": 0,
+  "updatedCount": 0,
+  "errors": [
+    { "rowNumber": 2, "column": "components", "barcode": "4900000000002",
+      "message": "Row 2 (Widget Bundle): component 4900000000999 was not found in the catalogue or this file." }
+  ]
+}
+```
+
+Inspect `errors[]` before treating an import as successful.
+
+### Existing Vs. New
+
+Rows are processed in order — `Single`, then `Package`, then `Bundle` —
+so that bundles can reference packages and packages can reference singles
+introduced in the same file. A barcode that already exists in the
+tenant's catalogue results in an **update** (name, sku, cost,
+threshold). New barcodes result in **create**.
+
+### Import Template
+
+```http
+GET /api/v1/products/import-template?format=Csv
+```
+
+Returns a downloadable file with one row of each type. Use it as the
+canonical schema for preparing imports.
+
+## Products Export
+
+```http
+POST /api/v1/products/export?format=Xlsx
+Authorization: Bearer <jwt>
+```
+
+```json
+HTTP/1.1 202 Accepted
+Content-Type: application/json
+
+{ "message": "Export requested. You'll receive it by email shortly.", "format": "Xlsx" }
+```
+
+The handler publishes a `ProductsExportRequestedMessage` to the
+`products.export` RabbitMQ queue with the requesting tenant, user, and
+format. `ProductsExportConsumer` (a hosted service registered in
+`Wrapsfer.Infrastructure`) picks it up:
+
+1. Loads the tenant's products.
+2. Renders them as `ProductExportRow` records.
+3. Writes a CSV or XLSX byte array via `IProductFileWriter`.
+4. Sends an email through the mail queue (`wrapsfer.mail`) using the
+   `products-export` template, with the file as an attachment.
+
+## Waybills Export
+
+```http
+POST /api/v1/waybills/export?format=Csv
+Authorization: Bearer <jwt>
+```
+
+```json
+HTTP/1.1 202 Accepted
+Content-Type: application/json
+
+{ "message": "Export requested.", "format": "Csv" }
+```
+
+`RequestWaybillsExportCommand` publishes to the `waybills.export` queue;
+`WaybillsExportConsumer` builds the file and dispatches it via the mail
+queue. Both consumers are managed by `IHostedService` and run inside the
+API process.
+
+## File Pipeline Internals
+
+For maintainers: `IProductFileParser` and `IProductFileWriter` have
+composite implementations that delegate to format-specific parsers and
+writers (`CsvProductFileParser`, `ExcelProductFileParser`,
+`CsvProductFileWriter`, `ExcelProductFileWriter`). The shared row models
+live in `Wrapsfer.Application.Abstractions.FileProcessing` and are
+documented per-row in [Architecture](../maintainers/architecture).

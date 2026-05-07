@@ -1,0 +1,117 @@
+---
+title: Tenant Settings
+sidebar_label: Tenant Settings
+---
+
+# Tenant Settings
+
+Per-tenant configuration that influences stock alerting and email
+notifications. Endpoints live under `/api/v1/tenant-settings` and follow
+the standard auth/tenant rules.
+
+## Resource Shape
+
+`GET /api/v1/tenant-settings` returns:
+
+```json
+{
+  "tenantId": "acme",
+  "defaultLowStockThreshold": 25,
+  "recipients": [
+    { "id": "...", "email": "ops@acme.example", "isActive": true },
+    { "id": "...", "email": "manager@acme.example", "isActive": false }
+  ]
+}
+```
+
+The settings record is auto-created on first interaction. There is one
+`TenantSettings` row per tenant.
+
+## Default Low-Stock Threshold
+
+`defaultLowStockThreshold` is consulted whenever a product's own
+`lowStockThreshold` is `null`. The resolution order applied across the
+codebase (see `LowStockDetectedEvent` and product factories) is:
+
+1. The product's `lowStockThreshold` if set.
+2. The tenant's `DefaultLowStockThreshold` if set.
+3. The global `ProductSettings:GlobalLowStockThreshold` (default `10`).
+
+### Upsert
+
+```http
+PUT /api/v1/tenant-settings
+Content-Type: application/json
+
+{ "defaultLowStockThreshold": 25, "clearDefaultLowStockThreshold": false }
+```
+
+Body fields:
+
+| Field                            | Type   | Notes                                                |
+| -------------------------------- | ------ | ---------------------------------------------------- |
+| `defaultLowStockThreshold`       | int?   | New value. Must be `≥ 0`.                            |
+| `clearDefaultLowStockThreshold`  | bool   | When `true`, removes the threshold (back to global). |
+
+`204 No Content` on success.
+
+## Notification Recipients
+
+Recipients are the email addresses that receive **low-stock** and
+**stock-recovered** alerts for the tenant. Each recipient has an
+`IsActive` flag — only active recipients receive notifications.
+
+### Add
+
+```http
+POST /api/v1/tenant-settings/recipients
+Content-Type: application/json
+
+{ "email": "ops@acme.example" }
+```
+
+`201 Created` with the recipient `Guid`. Errors:
+
+- `TenantSettings.InvalidEmail` (`400`) — email fails the lightweight
+  format check (must contain `@`, no spaces, characters before/after `@`).
+- `TenantSettings.RecipientAlreadyExists` (`409`) — case-insensitive match
+  on an existing recipient.
+
+### Remove
+
+```http
+DELETE /api/v1/tenant-settings/recipients/{id}
+```
+
+`204 No Content`. `404` (`TenantSettings.RecipientNotFound`) if no such
+recipient exists for the tenant.
+
+### Toggle Active
+
+```http
+PATCH /api/v1/tenant-settings/recipients/{id}
+Content-Type: application/json
+
+{ "isActive": false }
+```
+
+Use `false` to silence a recipient without removing them from the list.
+
+## Settings → Stock Alerts
+
+When `LowStockDetectedEvent` fires (e.g. via `PATCH /products/{id}/stock`
+crossing the threshold), `LowStockDetectedEventHandler`:
+
+1. Loads the tenant's `TenantSettings`.
+2. Filters `Recipients` to those with `IsActive = true`.
+3. Sends a `low-stock-alert` email via the mail queue.
+4. Records a `StockAlertLog` entry — see [Stock Alerts](./stock-alerts).
+
+If there are no active recipients, the handler logs a warning and writes
+a `Failed` alert log with `FailureReason = "NoRecipients"`.
+
+A 24-hour deduplication window is applied per
+`(tenantId, productId, alertType)` — repeat events within the window
+write a `Suppressed` log row instead of sending another email.
+`StockRecoveredEvent` is handled symmetrically with the
+`stock-recovered` template.

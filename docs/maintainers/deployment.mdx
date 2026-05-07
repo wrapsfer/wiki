@@ -5,150 +5,205 @@ sidebar_label: Deployment
 
 # Deployment
 
-What ships with the Wrapsfer API today for running it as a container, and what you need to think about before exposing it beyond local development. The repository includes a `Dockerfile` and a `docker-compose.yml`. There is **no** infrastructure-as-code, no platform-specific deploy manifest, and no CI/CD pipeline. This page describes only what exists.
+What ships with the Wrapsfer API for running it as a container, and what
+to think about before deploying outside local development. The repo
+includes a multi-stage `Dockerfile` and a `compose.yaml` that stands up
+the full stack (API + Postgres + RabbitMQ + Keycloak). There is no
+infrastructure-as-code or CI/CD pipeline checked in.
 
-For local non-Docker runs, see [Getting Started](../api/getting-started). For configuration the runtime reads, see [Configuration](./configuration).
+For local non-Docker runs, see
+[Getting Started](../api/getting-started). For the configuration the
+runtime reads, see [Configuration](./configuration).
 
-## Container Port
+## Image
 
-The container exposes a single HTTP port: **`8080`**. Verified in:
+The `Dockerfile` is a standard ASP.NET Core 10 multi-stage build:
 
-- `Dockerfile` — `EXPOSE 8080`.
-- `docker-compose.yml` — `ASPNETCORE_URLS: http://+:8080` and ports `"8080:8080"`.
+- Build stage: `mcr.microsoft.com/dotnet/sdk:10.0` — restores the
+  solution, then publishes `src/Wrapsfer.Api/Wrapsfer.Api.csproj`
+  (`-c Release`).
+- Runtime stage: `mcr.microsoft.com/dotnet/aspnet:10.0`, runs as the
+  non-root `app` user.
+- Default environment variables baked into the runtime image:
 
-ASP.NET Core needs `ASPNETCORE_URLS` to bind on `8080` inside the container. The published image's entry point is `dotnet Wrapsfer.Api.dll`, so without `ASPNETCORE_URLS` the host would fall back to its default ports (typically `5000`/`5001`) and the published port mapping would not match.
+  ```
+  ASPNETCORE_URLS=http://+:8080
+  ASPNETCORE_ENVIRONMENT=Production
+  DOTNET_NOLOGO=true
+  DOTNET_CLI_TELEMETRY_OPTOUT=true
+  ```
 
-## Run With Docker Compose
-
-`docker-compose.yml` defines a single `api` service that builds from the local `Dockerfile`, runs in `Development`, and publishes on host port `8080`:
-
-```yaml
-services:
-  api:
-    build:
-      context: .
-      dockerfile: Dockerfile
-    environment:
-      ASPNETCORE_ENVIRONMENT: Development
-      ASPNETCORE_URLS: http://+:8080
-    ports:
-      - "8080:8080"
-```
-
-From the API repository root:
-
-```bash
-docker compose up --build      # build the image and start the service
-docker compose up -d --build   # same, detached
-docker compose logs -f api     # follow logs
-docker compose down            # stop and remove the container
-```
-
-The Compose flow is intended for **local execution**. `ASPNETCORE_ENVIRONMENT=Development` is set, which means `appsettings.Development.json` is loaded **and** OpenAPI is mapped (see [Production Considerations](#production-considerations)).
-
-Smoke check the running container:
-
-```bash
-curl http://localhost:8080/health
-curl "http://localhost:8080/api/greetings?name=Vernon"
-```
-
-## Build And Run The Image Directly
-
-The `Dockerfile` is a standard multi-stage build (`mcr.microsoft.com/dotnet/sdk:10.0` for build, `mcr.microsoft.com/dotnet/aspnet:10.0` for the runtime image). Verified contents:
-
-- `WORKDIR /app`, `EXPOSE 8080`.
-- Restores `src/Wrapsfer.Api/Wrapsfer.Api.csproj` (which transitively pulls in Application, Infrastructure, and Domain).
-- Publishes `-c Release -o /app/publish --no-restore`.
-- Final image entry point: `ENTRYPOINT ["dotnet", "Wrapsfer.Api.dll"]`.
+- `EXPOSE 8080`. Entry point: `dotnet Wrapsfer.Api.dll`.
 
 Build the image:
 
 ```bash
-docker build -t wrapsfer-api .
+docker build -t wrapsfer-api:local .
 ```
 
-Run it:
+Run it directly (you must supply config — the API will not start
+without `ConnectionStrings__DefaultConnection`, RabbitMQ keys, etc.):
 
 ```bash
-docker run --rm -p 8080:8080 -e ASPNETCORE_URLS=http://+:8080 wrapsfer-api
+docker run --rm -p 8080:8080 \
+  -e ConnectionStrings__DefaultConnection="Host=...;Database=wrapsfer;..." \
+  -e RabbitMq__HostName=rabbit-host \
+  -e RabbitMq__UserName=... -e RabbitMq__Password=... \
+  -e Keycloak__BaseUrl=https://auth.example.com \
+  -e Keycloak__Audience=wrapsfer-api \
+  -e Mailing__Resend__ApiKey=... \
+  -e Mailing__Resend__FromAddress=noreply@example.com \
+  wrapsfer-api:local
 ```
 
-Run with a non-Development environment (OpenAPI will not be mapped):
+## `compose.yaml` (Full Stack)
+
+The repo also ships `compose.yaml` for spinning up the API alongside
+Postgres, RabbitMQ, and Keycloak — useful for full-stack local runs and
+as a reference for production wiring. Required environment variables
+(set in a `.env` next to the file or in your shell):
+
+| Variable                    | Purpose                                                |
+| --------------------------- | ------------------------------------------------------ |
+| `DOCKER_IMAGE`              | API image name (without tag). Used as `${DOCKER_IMAGE}:${IMAGE_TAG:-latest}`. |
+| `IMAGE_TAG`                 | Optional. Defaults to `latest`.                        |
+| `API_PORT`                  | Optional. Defaults to `8080`.                          |
+| `ASPNETCORE_ENVIRONMENT`    | Optional. Defaults to `Production`.                    |
+| `DB_USER`, `DB_PASSWORD`, `DB_NAME` | Postgres credentials.                          |
+| `DB_CONNECTION_STRING`      | Full connection string the API consumes (typically `Host=db;…;Database=${DB_NAME};Username=${DB_USER};Password=${DB_PASSWORD}`). |
+| `RABBITMQ_USER`, `RABBITMQ_PASSWORD`, `RABBITMQ_HOST` | RabbitMQ credentials and host (`rabbitmq`). |
+| `RESEND_API_KEY`, `RESEND_FROM_ADDRESS`, `RESEND_FROM_NAME` | Resend mailing config. |
+| `KEYCLOAK_*`                | Realm, audience, admin credentials, DB password, port. |
+
+Bring it up:
 
 ```bash
-docker run --rm \
-  -p 8080:8080 \
-  -e ASPNETCORE_URLS=http://+:8080 \
-  -e ASPNETCORE_ENVIRONMENT=Production \
-  wrapsfer-api
+docker compose up -d --build
+docker compose logs -f api
+docker compose down
 ```
 
-Override configuration values the same way you would locally — environment variables use double-underscore syntax for nested keys (see [Configuration → Environment Variable Reference](./configuration#environment-variable-reference)):
-
-```bash
-docker run --rm \
-  -p 8080:8080 \
-  -e ASPNETCORE_URLS=http://+:8080 \
-  -e ASPNETCORE_ENVIRONMENT=Production \
-  -e Cors__AllowedOrigins__0=https://app.example.com \
-  -e AllowedHosts=api.example.com \
-  wrapsfer-api
-```
+The Postgres and RabbitMQ services declare healthchecks; the API
+service waits on them via `depends_on.condition: service_healthy`.
 
 ## Production Considerations
 
-The boilerplate is **not production-ready as shipped**. The following items need explicit attention before any deployment outside local development. Each one is a known gap, not a recommendation that is already implemented.
+The default `Dockerfile` runtime environment is **`Production`** — the
+opposite of the local launch profiles. In `Production`:
 
-### CORS
+- **OpenAPI is not exposed.** `/openapi/v1.json` is only mapped when
+  `app.Environment.IsDevelopment()`. Don't change that without first
+  deciding how to protect the document — see
+  [OpenAPI → Production Exposure](../api/openapi#production-exposure).
+- **Detailed exception details are still hidden.** The exception
+  handler returns generic `ProblemDetails` regardless of environment;
+  raw stack traces never reach the wire. See
+  [Errors & Validation](../api/errors-validation).
 
-`Cors:AllowedOrigins` is `[]` in `appsettings.json`. The `DefaultCors` policy in `Program.cs` falls back to `AllowAnyOrigin().AllowAnyHeader().AllowAnyMethod()` when the list is empty. **Set `Cors:AllowedOrigins` to the explicit origin list** before exposing the service. See [Configuration → CORS Security Note](./configuration#cors-security-note).
-
-### Environment Configuration
-
-- `ASPNETCORE_ENVIRONMENT=Development` is set by `docker-compose.yml`. For non-local runs, set this to `Staging` or `Production` so `appsettings.Development.json` is not loaded and OpenAPI is not mapped.
-- Override anything sensitive (connection strings, secrets) through environment variables rather than committing them to `appsettings.*`. There is no secrets store wired in today (no `UserSecretsId`, no Azure Key Vault provider).
-- `AllowedHosts` is `"*"` in `appsettings.json`. Restrict it to the hostnames you actually serve.
-
-### OpenAPI Exposure
-
-`MapOpenApi()` is gated behind `app.Environment.IsDevelopment()` in `Program.cs`, so `/openapi/v1.json` is automatically not exposed when the environment is set to anything other than `Development`. **Do not move this call outside the `IsDevelopment()` branch** without first deciding how the document should be protected (auth, network restrictions, static artifact instead of live endpoint). See [OpenAPI → Production Exposure](../api/openapi#production-exposure).
+Other items to plan deliberately before any non-local deployment:
 
 ### Authentication
 
-There is no authentication scheme today. Every endpoint is publicly callable. `app.UseAuthorization()` is wired but no policies or `[Authorize]` attributes exist. **Do not deploy publicly without first adding authentication and authorization**. See [Development Workflow → Adding Authentication Later](./development-workflow#adding-authentication-later).
+Wrapsfer requires a working Keycloak with the realms your tenants need.
+Configure:
+
+- `Keycloak:BaseUrl` — must be reachable from the API container.
+- `Keycloak:OwnerRealm` — the staff/admin realm (default `owner`).
+- `Keycloak:Audience` — must match the JWT `aud` claim issued for
+  this API (default `wrapsfer-api`).
+- `Keycloak:RequireHttpsMetadata = true` for production (the runtime
+  default). Only set to `false` for local Keycloak over HTTP.
+
+See [Authentication & Tenancy](../api/authentication-tenancy) and
+[Authentication Internals](./authentication-internals).
 
 ### TLS
 
-`app.UseHttpsRedirection()` is in the pipeline, but the container only exposes HTTP on `8080`. Production deployments should terminate TLS upstream (load balancer, ingress, reverse proxy) and forward to the container on `8080`. If TLS termination happens at the container, supply HTTPS bindings via `ASPNETCORE_URLS` and the appropriate certificate configuration.
+The container exposes HTTP on `8080`. `app.UseHttpsRedirection()` is in
+the pipeline, but production deployments should terminate TLS upstream
+(load balancer, ingress, reverse proxy) and forward HTTP to the
+container. If TLS termination happens at the container, supply HTTPS
+bindings via `ASPNETCORE_URLS` and the appropriate certificate
+configuration.
+
+### Database
+
+- Provision PostgreSQL separately (managed service or a dedicated host).
+- Apply pending migrations before promoting an image:
+
+  ```bash
+  export WRAPSFER_DESIGN_CONNECTION="<production connection string>"
+  dotnet ef database update \
+    --project src/Wrapsfer.Infrastructure/Wrapsfer.Infrastructure.csproj \
+    --startup-project src/Wrapsfer.Api/Wrapsfer.Api.csproj
+  ```
+
+  In a CI flow, run the equivalent `dotnet ef migrations script`
+  output through your migration tooling — see
+  [Database & Migrations](./database-migrations).
+
+### Secrets
+
+Do not bake secrets into images. Inject them through environment
+variables (Compose `.env`, Kubernetes Secrets, ECS task definitions,
+etc.). For longer-term storage, the optional Infisical integration
+loads secrets from your Infisical project on startup — see
+[Configuration → Infisical](./configuration#infisical).
 
 ### Observability
 
-The repository ships:
+The repo ships:
 
-- ASP.NET Core's default logging (Console, Debug, EventSource on Linux/macOS).
-- `ExceptionHandlingMiddleware` writing exceptions to `ILogger<ExceptionHandlingMiddleware>`.
+- **Serilog** with the console sink and `FromLogContext`,
+  `WithMachineName`, `WithThreadId` enrichers.
+- **Health checks** at `/health`, aggregating Npgsql and RabbitMQ.
 
-It does **not** ship:
+Add additional sinks (Seq, Elasticsearch, OTLP) by referencing the
+package and listing it under the `Serilog:Using` and `Serilog:WriteTo`
+sections of `appsettings.{Environment}.json` or environment overrides.
 
-- Structured logging (Serilog, NLog, or similar).
-- Metrics (OpenTelemetry, Prometheus, App Insights).
-- Distributed tracing.
-- A health-check UI or readiness/liveness split (`/health` is a single aggregate endpoint with no custom checks registered).
+There is no metrics or distributed-tracing framework wired in today —
+add OpenTelemetry separately if needed.
 
-Pick observability infrastructure separately and wire it before relying on the service in production.
+### CORS And Allowed Hosts
 
-### Persistence And State
+Both default to permissive values:
 
-The API has no database, no persistent storage, and no in-memory state that needs to survive restarts. Containers can be restarted or replaced freely today. When persistence is added (see [Development Workflow → Adding Persistence Later](./development-workflow#adding-persistence-later)), revisit this section.
+- `AllowedHosts: "*"` in `appsettings.json`.
+- No `Cors` policy is registered in source — controllers run without
+  cross-origin restrictions.
+
+Tighten both before a public deployment: set `AllowedHosts` to the
+hostnames you actually serve and add a CORS policy if browser clients
+will call the API.
+
+### Background Services
+
+The API process hosts three background services:
+
+- `ProductsExportConsumer`
+- `WaybillsExportConsumer`
+- `AutoCancelStaleDraftsJob` (hourly)
+
+Running multiple instances of the API container is safe — RabbitMQ
+distributes export messages across consumers, and the stale-draft job
+takes per-waybill scopes (race losers will simply find the waybill
+already cancelled and skip). See
+[Messaging & Background Jobs](./messaging-background-jobs) for details.
 
 ### Deployment Platform
 
-The `Dockerfile` and `docker-compose.yml` make no assumptions about a specific cloud or orchestrator. The image is a standard ASP.NET Core 10 container image and can be run anywhere a container can run — Kubernetes, ECS, Cloud Run, Azure Container Apps, a single VM with Docker, etc. Pick a target deliberately and supply the platform-specific manifests separately; nothing in this repo is tailored to one.
+The `Dockerfile` and `compose.yaml` make no assumptions about a
+specific cloud or orchestrator. The image is a standard ASP.NET Core 10
+container and can run anywhere a container can run — Kubernetes, ECS,
+Cloud Run, Azure Container Apps, plain Docker on a VM. Pick a target
+deliberately and supply platform-specific manifests separately;
+nothing in this repo is tailored to one.
 
 ## See Also
 
-- [Getting Started](../api/getting-started) — local non-Docker runs and Docker Compose smoke tests.
-- [Configuration](./configuration) — keys, environment variables, CORS, host filtering.
-- [OpenAPI](../api/openapi) — Development-only gating of `/openapi/v1.json`.
-- [Development Workflow](./development-workflow) — future-work guidance for persistence and authentication.
+- [Getting Started](../api/getting-started) — local runs.
+- [Configuration](./configuration) — every key the runtime consumes.
+- [Database & Migrations](./database-migrations) — migration commands for production rollouts.
+- [Messaging & Background Jobs](./messaging-background-jobs) — what the hosted services do.
+- [Authentication & Tenancy](../api/authentication-tenancy) — Keycloak setup expectations.

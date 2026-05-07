@@ -1,0 +1,96 @@
+---
+title: Stock Alerts
+sidebar_label: Stock Alerts
+---
+
+# Stock Alerts
+
+A read-only history of low-stock and stock-recovery notifications for the
+tenant. Every alert produced by the domain event handlers writes a row to
+`stock_alert_logs`; this endpoint surfaces them.
+
+There is one endpoint, mounted at `/api/v1/stock-alerts`. Authorization
+and tenancy follow the standard rules.
+
+## List
+
+```http
+GET /api/v1/stock-alerts?productId={guid}&alertType=LowStock&from=2026-04-01&to=2026-05-01&page=1&pageSize=20
+```
+
+| Query       | Type               | Default | Notes                                    |
+| ----------- | ------------------ | ------- | ---------------------------------------- |
+| `productId` | `Guid?`            | —       | Filter to a single product.              |
+| `alertType` | `StockAlertType?`  | —       | `"LowStock"` or `"Recovered"`.           |
+| `from`      | `DateTime?`        | —       | Inclusive lower bound on `OccurredOn`.   |
+| `to`        | `DateTime?`        | —       | Inclusive upper bound on `OccurredOn`.   |
+| `page`      | int                | `1`     |                                          |
+| `pageSize`  | int                | `20`    |                                          |
+
+Returns `PagedResult<StockAlertLogResponse>`:
+
+```json
+{
+  "items": [
+    {
+      "id": "...",
+      "productId": "...",
+      "productName": "Acme Widget",
+      "barcode": "4900000000001",
+      "alertType": "LowStock",
+      "stockQuantity": 4,
+      "threshold": 10,
+      "deliveryStatus": "Sent",
+      "recipientsNotified": "ops@acme.example,manager@acme.example",
+      "failureReason": null,
+      "occurredOn": "2026-05-07T14:32:00Z"
+    }
+  ],
+  "totalCount": 1,
+  "page": 1,
+  "pageSize": 20
+}
+```
+
+## Field Reference
+
+| Field                | Notes                                                                                |
+| -------------------- | ------------------------------------------------------------------------------------ |
+| `productName`        | Snapshot of the product name at the time of the alert.                               |
+| `barcode`            | Snapshot of the barcode at the time of the alert.                                    |
+| `alertType`          | `LowStock` (stock dropped at/below threshold) or `Recovered` (stock crossed back).   |
+| `stockQuantity`      | Stock at the moment the event fired.                                                 |
+| `threshold`          | Resolved threshold (product → tenant default → global).                              |
+| `deliveryStatus`     | `Sent`, `Failed`, or `Suppressed`.                                                   |
+| `recipientsNotified` | Comma-separated emails recorded with the `Sent` log.                                 |
+| `failureReason`      | Set when `deliveryStatus ∈ {Failed, Suppressed}` (e.g. `"NoRecipients"`, `"DedupeWindow"`). |
+
+## Delivery Status
+
+`StockAlertDeliveryStatus`:
+
+| Value        | Meaning                                                                  |
+| ------------ | ------------------------------------------------------------------------ |
+| `Sent`       | The alert was enqueued for the configured recipients via the mail queue. |
+| `Failed`     | No active recipients configured (or another delivery problem).           |
+| `Suppressed` | Within the 24-hour dedupe window for this product + alert type.          |
+
+The dedupe window prevents flapping stock from generating noise. Repeated
+crossings within 24 hours write `Suppressed` logs but do not trigger
+additional emails. The alert log is therefore the source of truth for
+what was actually delivered.
+
+## Generating Alerts
+
+Alerts are produced indirectly — there is no `POST /stock-alerts`
+endpoint. They are written by the domain event handlers in response to:
+
+- `PATCH /api/v1/products/{id}/stock` setting a quantity that crosses
+  the resolved threshold.
+- `POST /api/v1/products/{id}/unpack` where the target product crosses
+  the threshold after restoration.
+- The product import flow when newly created products start below the
+  resolved threshold.
+
+See [Tenant Settings](./tenant-settings) for how to control who receives
+the resulting emails.

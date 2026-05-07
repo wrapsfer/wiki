@@ -1,0 +1,205 @@
+---
+title: Authentication Internals
+sidebar_label: Authentication Internals
+---
+
+# Authentication Internals
+
+How JWT validation, realm resolution, and tenant context fit together.
+The consumer-facing contract is in
+[Authentication & Tenancy](../api/authentication-tenancy); this page is
+for maintainers extending or debugging the auth pipeline.
+
+## Component Map
+
+| Component                          | Type                  | Lifetime  | Purpose                                                                |
+| ---------------------------------- | --------------------- | --------- | ---------------------------------------------------------------------- |
+| `KeycloakOptions`                  | options               | singleton | Bound from `Keycloak`. Validated by `KeycloakOptionsValidator`.        |
+| `RealmConfigurationCache`          | service               | singleton | Per-realm OIDC config + signing keys. Backed by `IHttpClientFactory`.  |
+| `ITenantRealmResolver`             | abstraction           | scoped    | Implemented by `SubdomainTenantRealmResolver`.                         |
+| `MultiTenantJwtBearerEvents`       | `JwtBearerEvents`     | scoped    | Resolves the realm and overrides token-validation parameters per request. |
+| `KeycloakClaimsTransformation`     | `IClaimsTransformation` | scoped  | Maps `realm_access.roles` JSON into `ClaimTypes.Role` claims.          |
+| `KeycloakClaimParser`              | static helper         | —         | Extracts roles, parses tenant info, defines `TenantRealmKey`.          |
+| `ITenantContext`                   | abstraction           | scoped    | Implemented by `HttpTenantContext`. Reads `HttpContext.Items`.         |
+| `TenantResolutionFilter`           | action filter         | scoped    | Enforces owner-realm `tenantId` query rules.                           |
+
+## Boot Sequence
+
+`AddInfrastructure(builder.Configuration)` calls
+`AddKeycloakAuthentication`:
+
+1. Bind and validate `KeycloakOptions` (`ValidateOnStart`).
+2. Register the named `KeycloakOidc` HTTP client.
+3. Register the cache, resolver, and `JwtBearerEvents` (scoped).
+4. Configure the `JwtBearer` scheme:
+   - `Authority = {BaseUrl}/realms/{OwnerRealm}` — used as a fallback
+     during pipeline construction, but real OIDC discovery happens
+     per-request via `MultiTenantJwtBearerEvents`.
+   - `Audience = {Audience}`.
+   - `RequireHttpsMetadata = {RequireHttpsMetadata}`.
+   - `MapInboundClaims = false` — keep raw JWT claim names (`sub`,
+     `realm_access`).
+   - `Configuration = new OpenIdConnectConfiguration()` — disables the
+     default discovery (replaced per request).
+   - `EventsType = typeof(MultiTenantJwtBearerEvents)`.
+5. `AddAuthorization()` (no policies are registered in code today).
+
+## Per-Request Flow
+
+```text
+HTTP request
+   │
+   ▼
+Authentication middleware (UseAuthentication)
+   │
+   ├─ MultiTenantJwtBearerEvents.MessageReceived
+   │     ├─ ITenantRealmResolver.ResolveRealm(HttpRequest)
+   │     ├─ HttpContext.Items[TenantRealmKey] = realm
+   │     └─ context.Options.TokenValidationParameters = (per-realm signing keys, issuer, audience)
+   │
+   ▼
+JwtBearer validates the bearer token against the per-realm parameters
+   │
+   ▼
+KeycloakClaimsTransformation.TransformAsync
+   └─ adds ClaimTypes.Role claims from realm_access.roles
+   │
+   ▼
+Authorization middleware (UseAuthorization)
+   │
+   ▼
+TenantResolutionFilter (action filter on tenant-aware controllers)
+   ├─ if HttpContext.Items[TenantRealmKey] == OwnerRealm:
+   │     ├─ require ?tenantId=...
+   │     ├─ reject tenantId == OwnerRealm
+   │     └─ HttpContext.Items[TenantRealmKey] = tenantId
+   │
+   ▼
+Controller action runs
+   │
+   ▼
+HttpTenantContext.TenantId / .UserId / .Roles consumed by handlers
+```
+
+## `MultiTenantJwtBearerEvents`
+
+The custom `JwtBearerEvents`. Key responsibilities:
+
+- **`MessageReceived`** — call `ITenantRealmResolver` to determine the
+  realm for this request, store it on `HttpContext.Items`, and load the
+  realm's OIDC configuration through `RealmConfigurationCache`. The
+  resulting `IssuerSigningKeys`, `ValidIssuer`, and audience are set on
+  `context.Options.TokenValidationParameters` so the bearer handler
+  validates against the correct realm.
+- **`Challenge` / `Forbidden`** — defaults from `JwtBearerEvents` (the
+  global exception handler customizes the 401 ProblemDetails for the
+  "tenant not resolved" / "user not authenticated" cases).
+
+## `RealmConfigurationCache`
+
+Concurrency-safe cache of OpenID configuration per realm. For an
+unknown realm it issues:
+
+```text
+{BaseUrl}/realms/{realm}/.well-known/openid-configuration
+```
+
+Configuration is cached for the lifetime of the process. Disposal of the
+cache or restart of the service is required to refresh signing keys —
+sufficient for typical Keycloak deployments where keys rotate
+infrequently. If you need active key rotation, add a TTL or refresh
+trigger.
+
+## `SubdomainTenantRealmResolver`
+
+```csharp
+public string ResolveRealm(HttpRequest request)
+{
+    if (request.Headers.TryGetValue("X-Tenant-Realm", out StringValues hdr) &&
+        !string.IsNullOrWhiteSpace(hdr.ToString()))
+    {
+        return hdr.ToString();
+    }
+
+    string host = request.Host.Host;
+    if (string.IsNullOrWhiteSpace(host))
+    {
+        throw new InvalidOperationException("Unable to resolve tenant: Host header is missing or empty.");
+    }
+
+    if (!host.Contains('.')) return _options.OwnerRealm;
+    string[] parts = host.Split('.');
+    if (parts.Length < 3) return _options.OwnerRealm;
+    string subdomain = parts[0];
+    if (string.Equals(subdomain, "app", StringComparison.OrdinalIgnoreCase))
+        return _options.OwnerRealm;
+    return subdomain;
+}
+```
+
+The header takes precedence so internal callers and tests can override
+realm without rewriting URLs. The `app` subdomain is reserved for the
+front-end app shell and routes through the owner realm.
+
+## `HttpTenantContext`
+
+Implements `ITenantContext` from `Wrapsfer.Application.Abstractions`:
+
+- `TenantId` — reads `HttpContext.Items[TenantRealmKey]`. Throws
+  `InvalidOperationException("Tenant realm has not been resolved.")` if
+  missing — caught by the global handler and returned as `401`.
+- `UserId` — `User.FindFirst("sub")?.Value`. Throws
+  `InvalidOperationException("User is not authenticated.")` if missing.
+- `Roles` — parsed from `realm_access` JSON via
+  `KeycloakClaimParser.ExtractRealmRoles`.
+
+The interceptors (`AuditableEntityInterceptor`, `AuditLogInterceptor`)
+also depend on `ITenantContext` but swallow access errors when no HTTP
+scope exists — important so background services running in their own
+DI scope can save without crashing.
+
+## `TenantResolutionFilter`
+
+Action filter applied as `[ServiceFilter(typeof(TenantResolutionFilter))]`
+on the tenant-aware controllers (`ProductsController`,
+`WaybillsController`, `TenantSettingsController`,
+`StockAlertsController`). It enforces the owner-realm `tenantId` query
+rules covered in [Authentication & Tenancy](../api/authentication-tenancy).
+`MeController` deliberately does not apply it.
+
+## Adding A New Auth-Aware Controller
+
+```csharp
+[ApiVersion("1.0")]
+[Route("api/v{version:apiVersion}/things")]
+[ServiceFilter(typeof(TenantResolutionFilter))]
+public sealed class ThingsController(ISender sender) : ApiControllerBase
+{
+    // [Authorize] is inherited from ApiControllerBase.
+}
+```
+
+Skip `TenantResolutionFilter` if the endpoint is **owner-realm only**
+(no partner impersonation), or if it has no tenant context at all (like
+`MeController`).
+
+## Adding A Role Check
+
+There are no role-based policies today, so `[Authorize]` requires only
+authentication. To add a role gate:
+
+```csharp
+[Authorize(Roles = "admin")]
+public Task<IActionResult> Sensitive() { ... }
+```
+
+The `KeycloakClaimsTransformation` already maps realm roles to
+`ClaimTypes.Role`, so this works out of the box. For more elaborate
+policies, register them in `AddAuthorization` and reference them by
+name with `[Authorize(Policy = "...")]`.
+
+## See Also
+
+- [Authentication & Tenancy](../api/authentication-tenancy) — consumer-facing contract.
+- [Configuration](./configuration#keycloak) — required `Keycloak` keys.
+- [Architecture](./architecture) — where `ITenantContext` is consumed.

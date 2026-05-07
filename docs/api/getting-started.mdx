@@ -5,118 +5,182 @@ sidebar_label: Getting Started
 
 # Getting Started
 
-Run the Wrapsfer API locally and verify it works.
+Run the Wrapsfer API locally against PostgreSQL, Keycloak, and RabbitMQ, then
+verify it works.
+
+The full step-by-step is also tracked in the API repo at `SETUP.md`. This page
+mirrors that flow at a higher level and points out the config the API
+actually consumes.
 
 ## Prerequisites
 
-- **.NET 10 SDK.** Required for `dotnet restore`, `dotnet build`, `dotnet run`, and `dotnet test`.
-- **Docker** (optional). Required only if you want to run the API via Docker Compose.
+- **.NET SDK 10.0.201** or a compatible 10.x feature SDK.
+- **Docker** (for PostgreSQL, Keycloak, RabbitMQ — and optionally Redis).
+- **Entity Framework Core CLI tools** for migrations:
 
-Verify your .NET install:
+  ```bash
+  dotnet tool install --global dotnet-ef
+  ```
+
+Check the .NET install with `dotnet --info`.
+
+## Start Local Infrastructure
+
+The API expects PostgreSQL, Keycloak, and RabbitMQ to be reachable. The
+quickest path on a developer machine uses individual `docker run` commands
+on a shared network — see `SETUP.md` in the API repo for copy-pasteable
+commands. The repo also ships a `compose.yaml` for the deployable stack.
+
+What the API connects to:
+
+| Component  | Default local URL              | Purpose                                                  |
+| ---------- | ------------------------------ | -------------------------------------------------------- |
+| PostgreSQL | `localhost:5432`               | Application data and audit log.                          |
+| Keycloak   | `http://localhost:8180`        | JWT issuer for tenant realms (per-realm OIDC discovery). |
+| RabbitMQ   | `localhost:5672` (mgmt `:15672`) | `products.export`, `waybills.export`, `wrapsfer.mail`.   |
+
+The application database name expected by the API is `wrapsfer`; create it
+once after Postgres is up:
 
 ```bash
-dotnet --info
+docker exec postgres createdb -U vernon wrapsfer
 ```
 
-## Get The Source
+## Configure The API
 
-The API lives in its own repository, separate from this docs site. Clone it locally:
+Local config goes through user secrets so passwords are not committed. From
+the API repo root:
 
 ```bash
-git clone <wrapsfer-api-repo-url>
-cd wrapsfer/api
+dotnet user-secrets set "ConnectionStrings:DefaultConnection" \
+  "Host=localhost;Port=5432;Database=wrapsfer;Username=vernon;Password=password" \
+  --project src/Wrapsfer.Api/Wrapsfer.Api.csproj
+
+dotnet user-secrets set "Keycloak:BaseUrl" "http://localhost:8180" \
+  --project src/Wrapsfer.Api/Wrapsfer.Api.csproj
+dotnet user-secrets set "Keycloak:RequireHttpsMetadata" "false" \
+  --project src/Wrapsfer.Api/Wrapsfer.Api.csproj
+
+dotnet user-secrets set "RabbitMq:HostName" "localhost" \
+  --project src/Wrapsfer.Api/Wrapsfer.Api.csproj
+dotnet user-secrets set "RabbitMq:Port" "5672" \
+  --project src/Wrapsfer.Api/Wrapsfer.Api.csproj
+dotnet user-secrets set "RabbitMq:UserName" "vernon" \
+  --project src/Wrapsfer.Api/Wrapsfer.Api.csproj
+dotnet user-secrets set "RabbitMq:Password" "password" \
+  --project src/Wrapsfer.Api/Wrapsfer.Api.csproj
+dotnet user-secrets set "RabbitMq:VirtualHost" "/" \
+  --project src/Wrapsfer.Api/Wrapsfer.Api.csproj
 ```
 
-All commands below are run from the API repository root.
+`appsettings.json` ships sensible defaults for `Keycloak:OwnerRealm = "owner"`
+and `Keycloak:Audience = "wrapsfer-api"`. The Resend API key
+(`Mailing:Resend:ApiKey`) is required by `Wrapsfer.Mailing` startup
+validation; for local-only flows where you do not actually send email,
+set a placeholder via user secrets to satisfy the `ValidateOnStart` check.
 
-## Run From The .NET CLI
+Full configuration reference is in
+[Configuration](../maintainers/configuration).
 
-Restore, build, and run the API:
+## Restore, Build, Test
+
+```bash
+make restore
+make build
+make test
+```
+
+Equivalent commands without Make:
 
 ```bash
 dotnet restore
-dotnet build
-dotnet run --project src/Wrapsfer.Api
+dotnet build --no-restore
+dotnet test --no-restore --no-build
 ```
 
-`dotnet run` honors `src/Wrapsfer.Api/Properties/launchSettings.json`. Two profiles are defined:
+## Apply Database Migrations
 
-| Profile | URLs                                            | Environment   |
-| ------- | ----------------------------------------------- | ------------- |
-| `http`  | `http://localhost:5167`                         | `Development` |
-| `https` | `https://localhost:7134` and `http://localhost:5167` | `Development` |
-
-`dotnet run` uses the **first** profile (`http`) by default. Pick a specific profile with `--launch-profile`:
+`ApplicationDbContextFactory` reads the design-time connection string from
+the `WRAPSFER_DESIGN_CONNECTION` environment variable; if unset, it falls
+back to `Host=localhost;Port=5432;Database=wrapsfer;Username=postgres;Password=postgres`.
+Set the env var so it matches your local Postgres credentials before
+running migrations:
 
 ```bash
-dotnet run --project src/Wrapsfer.Api --launch-profile http
-dotnet run --project src/Wrapsfer.Api --launch-profile https
+export WRAPSFER_DESIGN_CONNECTION="Host=localhost;Port=5432;Database=wrapsfer;Username=vernon;Password=password"
+
+dotnet ef database update \
+  --project src/Wrapsfer.Infrastructure/Wrapsfer.Infrastructure.csproj \
+  --startup-project src/Wrapsfer.Api/Wrapsfer.Api.csproj
 ```
 
-### Override The Local URL
+For migration commands and the current migration list, see
+[Database & Migrations](../maintainers/database-migrations).
 
-To bypass `launchSettings.json` and pick the URL explicitly, use `--no-launch-profile` together with `ASPNETCORE_URLS`:
+## Run The API
 
 ```bash
-ASPNETCORE_URLS=http://localhost:8080 dotnet run --project src/Wrapsfer.Api --no-launch-profile
+dotnet run --project src/Wrapsfer.Api/Wrapsfer.Api.csproj
 ```
 
-This is useful when the launch-profile ports conflict with another local process, or when you want the API to listen on the same port as the Docker setup (8080).
+`launchSettings.json` defines two profiles, both with
+`ASPNETCORE_ENVIRONMENT=Development`:
 
-## Run With Docker Compose
+| Profile | URLs                                            |
+| ------- | ----------------------------------------------- |
+| `http`  | `http://0.0.0.0:5222`                           |
+| `https` | `https://0.0.0.0:7065;http://0.0.0.0:5222`      |
 
-The repo ships a `Dockerfile` and `docker-compose.yml`. Compose builds the multi-stage image, runs the API in `Development`, and maps it to `http://localhost:8080`:
+`dotnet run` uses the **first** profile (`http`) by default. To pin a port
+explicitly:
 
 ```bash
-docker compose up --build
+ASPNETCORE_URLS=http://localhost:8080 \
+  dotnet run --project src/Wrapsfer.Api/Wrapsfer.Api.csproj --no-launch-profile
 ```
 
-The compose service sets:
-
-- `ASPNETCORE_ENVIRONMENT=Development`
-- `ASPNETCORE_URLS=http://+:8080`
-- Port mapping `8080:8080`
-
-To run the image without Compose:
-
-```bash
-docker build -t wrapsfer-api .
-docker run --rm -p 8080:8080 -e ASPNETCORE_URLS=http://+:8080 wrapsfer-api
-```
-
-The Dockerfile's `EXPOSE` is `8080`. Pick `ASPNETCORE_URLS` and the published port to match.
+The `compose.yaml` deployment stack (`API_PORT`, default `8080`) maps a
+different port than the local launch profile. Use whichever the binary
+actually printed at startup.
 
 ## Smoke Test
 
-Use whichever URL matches how you started the API.
-
-For the default `http` launch profile (`http://localhost:5167`):
+For the default `http` launch profile (`http://localhost:5222`):
 
 ```bash
-curl http://localhost:5167/health
-curl "http://localhost:5167/api/greetings?name=Vernon"
-curl http://localhost:5167/openapi/v1.json
+curl http://localhost:5222/health
+curl http://localhost:5222/openapi/v1.json
 ```
 
-For Docker Compose (`http://localhost:8080`):
+`/health` aggregates the Npgsql and RabbitMQ health checks registered in
+`ServiceCollectionExtensions.AddServices`; expect `Healthy` once both are
+reachable. `/openapi/v1.json` is mapped only when the host is in
+`Development`.
+
+To call any business endpoint, supply a Keycloak JWT for an existing realm
+and either set the realm via header or use a subdomain host name:
 
 ```bash
-curl http://localhost:8080/health
-curl "http://localhost:8080/api/greetings?name=Vernon"
-curl http://localhost:8080/openapi/v1.json
+curl -H "Authorization: Bearer $TOKEN" \
+     -H "X-Tenant-Realm: acme" \
+     http://localhost:5222/api/v1/me
 ```
 
-Expected behavior:
+See [Authentication & Tenancy](./authentication-tenancy) for the full
+contract, including the owner-realm `tenantId` query parameter rule.
 
-- `/health` returns `200` with the ASP.NET Core health-check body (`Healthy`).
-- `/api/greetings?name=Vernon` returns `200` with a JSON `GreetingResponse` (`Message` plus `GeneratedAt`). The `name` query parameter defaults to `"World"` and is validated as `[StringLength(80, MinimumLength = 1)]`.
-- `/openapi/v1.json` returns the OpenAPI document **only** in `Development` (it is mapped behind `app.Environment.IsDevelopment()`).
+## Bruno Collection
 
-For full request/response details, see the [Endpoint Reference](./endpoint-reference). For error and validation behavior, see [Errors & Validation](./errors-validation).
+The API repo ships a [Bruno](https://www.usebruno.com) collection at
+`bruno/` with `Auth/`, `Me/`, and `Products/` folders. Pair it with one of
+the environments under `bruno/environments/` — set the `baseUrl` and the
+JWT/realm variables, then exercise the endpoints. The collection does not
+cover every controller; treat it as a starter, not a contract source.
 
 ## Where To Go Next
 
-- [API Overview](./overview) — what is and is not in the boilerplate.
-- [Endpoint Reference](./endpoint-reference) — request/response details.
-- [Configuration](../maintainers/configuration) — `appsettings.json`, environment variables, CORS, and app options.
-- [Development Workflow](../maintainers/development-workflow) — recommended flow for adding a feature.
+- [Authentication & Tenancy](./authentication-tenancy) — JWT, realms, owner-realm rules.
+- [Products](./products), [Waybills](./waybills) — module references with examples.
+- [Errors & Validation](./errors-validation) — error contract.
+- [Configuration](../maintainers/configuration) — required vs. local-only configuration keys.
+- [Development Workflow](../maintainers/development-workflow) — adding a feature end to end.

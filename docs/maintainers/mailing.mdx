@@ -1,0 +1,150 @@
+---
+title: Mailing
+sidebar_label: Mailing
+---
+
+# Mailing
+
+`Wrapsfer.Mailing` is a self-contained module that other code calls
+through `IMailer`. The implementation publishes a serialized
+`MailRequestedMessage` to RabbitMQ; a hosted consumer drains the queue,
+renders templates, and sends through Resend via FluentEmail.
+
+## High-Level Flow
+
+```text
+Caller (e.g. LowStockDetectedEventHandler)
+   │  IMailer.SendAsync(MailMessage)
+   ▼
+RabbitMqMailer  ──►  RabbitMQ queue "wrapsfer.mail"
+                                   │
+                                   ▼
+                MailProcessingConsumer (hosted service)
+                                   │
+                                   ▼
+              ITemplateRenderer (Fluid)  ──►  rendered subject + bodies
+                                   │
+                                   ▼
+              IFluentEmailMailSender ── FluentEmail + Resend ── Resend API
+```
+
+## Sending Mail From Application Code
+
+`Wrapsfer.Application.Products.EventHandlers.LowStockDetectedEventHandler`
+is the canonical example:
+
+```csharp
+MailMessage mail = new()
+{
+    To = recipients,
+    TemplateName = "low-stock-alert",
+    Tokens = new Dictionary<string, object?>
+    {
+        ["ProductName"] = e.ProductName,
+        ["Barcode"] = e.Barcode,
+        ["CurrentStock"] = e.CurrentStock,
+        ["Threshold"] = e.Threshold
+    }
+};
+
+MailRequestId requestId = await mailer.SendAsync(mail, cancellationToken);
+```
+
+A `MailMessage` must have **exactly one** of:
+
+- `Subject` + `Body` (literal text/HTML), **or**
+- `TemplateName` (renders the named template).
+
+Mixing both, or supplying neither, throws `ArgumentException`.
+
+`Tokens` are stringified in the publisher (`object? → string?`). The
+template renderer treats them as Liquid variables.
+
+## Templates
+
+Templates live in `src/Wrapsfer.Mailing/Templates/Files/{TemplateName}/`
+as three files:
+
+```
+{TemplateName}/
+  subject.liquid       Plain-text subject template
+  body.html.liquid     HTML body
+  body.text.liquid     Plain-text fallback body
+```
+
+Files are compiled by `FluidTemplateRenderer` and cached as
+`CachedTemplate`. The current template names ship with the repo:
+
+| Template            | Used by                                            |
+| ------------------- | -------------------------------------------------- |
+| `low-stock-alert`   | `LowStockDetectedEventHandler` (Products module).  |
+| `stock-recovered`   | `StockRecoveredEventHandler` (Products module).    |
+| `products-export`   | `ProductsExportConsumer` to deliver export files.  |
+
+To add a template:
+
+1. Create `Templates/Files/{name}/subject.liquid`,
+   `body.html.liquid`, `body.text.liquid`.
+2. Set the file actions to `EmbeddedResource` if the project does not
+   already include them via globbing — check the existing folders to
+   match how templates are loaded.
+3. Reference the template by `TemplateName` from a caller.
+
+## Consumer
+
+`MailProcessingConsumer` (hosted service) listens on the
+`Mailing:Queue:QueueName` queue (default `wrapsfer.mail`). Per message:
+
+1. Deserialize `MailRequestedMessage`.
+2. Build the outbound `MailMessage` (recipients, attachments, tokens).
+3. If `TemplateName` is set, render the three template files into
+   `Subject` / HTML body / text body. Otherwise, use the literal
+   `Subject`/`Body`.
+4. Send via `IFluentEmailMailSender`. Configured From address comes from
+   `Mailing:Resend:FromAddress` and `Mailing:Resend:FromName`.
+5. Apply `MailRetryPolicy` on transient failures
+   (`Mailing:Queue:MaxRetries`, `Mailing:Queue:InitialBackoffSeconds`,
+   exponential backoff).
+
+## Resend Integration
+
+`Wrapsfer.Mailing.Resend.FluentEmailMailSender` wraps FluentEmail's
+Resend sender (`AddResend`). The `ResendClientOptions.ApiToken` is fed
+from `Mailing:Resend:ApiKey`:
+
+```csharp
+services.AddOptions<ResendClientOptions>()
+    .Configure<IOptions<ResendOptions>>((opts, resend) =>
+        opts.ApiToken = resend.Value.ApiKey);
+
+services.AddFluentEmail("placeholder@wrapsfer.local")
+    .AddResend();
+```
+
+The `placeholder@wrapsfer.local` From address is overridden per-send by
+the configured `FromAddress`/`FromName`.
+
+## Attachments
+
+`MailMessage.Attachments` accepts byte-array attachments (file name,
+content type, content). They are serialized as
+`SerializedAttachment` in the queue envelope. The export consumers use
+this to deliver CSV/XLSX files.
+
+## Configuration Recap
+
+| Key                                       | Required | Notes                                                        |
+| ----------------------------------------- | -------- | ------------------------------------------------------------ |
+| `Mailing:Resend:ApiKey`                   | yes      | Validated on start. Use a placeholder for local-only flows.  |
+| `Mailing:Resend:FromAddress`              | yes      | Sender address.                                              |
+| `Mailing:Resend:FromName`                 | no       | Default `"Wrapsfer"`.                                        |
+| `Mailing:Queue:QueueName`                 | no       | Default `"wrapsfer.mail"`.                                   |
+| `Mailing:Queue:MaxRetries`                | no       | Default `3`.                                                 |
+| `Mailing:Queue:InitialBackoffSeconds`     | no       | Default `1`.                                                 |
+| `RabbitMq:*`                              | yes      | Shared with the rest of the system.                          |
+
+## See Also
+
+- [Configuration](./configuration#mailing) — the full key reference.
+- [Messaging & Background Jobs](./messaging-background-jobs) — the publisher / consumer infrastructure that mailing builds on.
+- [Stock Alerts](../api/stock-alerts) and [Tenant Settings](../api/tenant-settings) — the consumer-facing surface that drives the most mail traffic today.

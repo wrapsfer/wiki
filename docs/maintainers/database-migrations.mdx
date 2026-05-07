@@ -1,0 +1,174 @@
+---
+title: Database & Migrations
+sidebar_label: Database & Migrations
+---
+
+# Database & Migrations
+
+Wrapsfer uses **EF Core 10** with the **Npgsql** provider against
+PostgreSQL. The `DbContext` is `Wrapsfer.Infrastructure.Persistence.ApplicationDbContext`,
+and migrations live in `src/Wrapsfer.Infrastructure/Migrations/`.
+
+## DbContext
+
+```csharp
+public sealed class ApplicationDbContext(DbContextOptions<ApplicationDbContext> options)
+    : DbContext(options), IUnitOfWork
+{
+    public DbSet<AuditLog> AuditLogs => Set<AuditLog>();
+    public DbSet<Product> Products => Set<Product>();
+    public DbSet<ProductComponent> ProductComponents => Set<ProductComponent>();
+    public DbSet<TenantSettings> TenantSettings => Set<TenantSettings>();
+    public DbSet<NotificationRecipient> NotificationRecipients => Set<NotificationRecipient>();
+    public DbSet<StockAlertLog> StockAlertLogs => Set<StockAlertLog>();
+    public DbSet<Waybill> Waybills => Set<Waybill>();
+    public DbSet<WaybillItem> WaybillItems => Set<WaybillItem>();
+
+    protected override void OnModelCreating(ModelBuilder modelBuilder) =>
+        modelBuilder.ApplyConfigurationsFromAssembly(typeof(ApplicationDbContext).Assembly);
+}
+```
+
+Per-entity configuration lives in
+`Persistence/Configurations/{Entity}Configuration.cs` and is auto-applied
+by `ApplyConfigurationsFromAssembly`. Three `SaveChangesInterceptor`s are
+registered alongside the context: `AuditableEntityInterceptor`,
+`AuditLogInterceptor`, and `DomainEventInterceptor` (see
+[Architecture](./architecture#interceptors)).
+
+`ApplicationDbContext` also implements `IUnitOfWork` from
+`Wrapsfer.Domain.Abstractions`, so handlers commit by calling
+`unitOfWork.SaveChangesAsync(cancellationToken)`.
+
+## Design-Time Factory
+
+`ApplicationDbContextFactory` provides the connection string used by
+`dotnet ef` commands:
+
+```csharp
+string connectionString = Environment.GetEnvironmentVariable("WRAPSFER_DESIGN_CONNECTION")
+                          ?? "Host=localhost;Port=5432;Database=wrapsfer;Username=postgres;Password=postgres";
+```
+
+Always set `WRAPSFER_DESIGN_CONNECTION` before running EF CLI commands so
+the migration runs against your real local database, not the
+postgres/postgres fallback:
+
+```bash
+export WRAPSFER_DESIGN_CONNECTION="Host=localhost;Port=5432;Database=wrapsfer;Username=vernon;Password=password"
+```
+
+The runtime API does **not** use this env var — it consumes
+`ConnectionStrings:DefaultConnection`.
+
+## EF Core CLI
+
+Make sure the EF tools are installed:
+
+```bash
+dotnet tool install --global dotnet-ef
+```
+
+All EF commands need both the project (`Wrapsfer.Infrastructure`, where
+the `DbContext` and migrations live) and the startup project
+(`Wrapsfer.Api`, which hosts configuration). Run them from the API repo
+root:
+
+```bash
+# Apply pending migrations
+dotnet ef database update \
+  --project src/Wrapsfer.Infrastructure/Wrapsfer.Infrastructure.csproj \
+  --startup-project src/Wrapsfer.Api/Wrapsfer.Api.csproj
+
+# List migrations
+dotnet ef migrations list \
+  --project src/Wrapsfer.Infrastructure/Wrapsfer.Infrastructure.csproj \
+  --startup-project src/Wrapsfer.Api/Wrapsfer.Api.csproj
+
+# Add a new migration
+dotnet ef migrations add <Name> \
+  --project src/Wrapsfer.Infrastructure/Wrapsfer.Infrastructure.csproj \
+  --startup-project src/Wrapsfer.Api/Wrapsfer.Api.csproj
+
+# Roll back to a specific migration (or "0" to undo all)
+dotnet ef database update <PreviousMigration> \
+  --project src/Wrapsfer.Infrastructure/Wrapsfer.Infrastructure.csproj \
+  --startup-project src/Wrapsfer.Api/Wrapsfer.Api.csproj
+
+# Generate a SQL script (for review or production deploys)
+dotnet ef migrations script <FromMigration> <ToMigration> \
+  --project src/Wrapsfer.Infrastructure/Wrapsfer.Infrastructure.csproj \
+  --startup-project src/Wrapsfer.Api/Wrapsfer.Api.csproj \
+  -o ./migration.sql
+```
+
+## Current Migrations
+
+In application order:
+
+| Timestamp        | Name                                  | Adds                                                                |
+| ---------------- | ------------------------------------- | ------------------------------------------------------------------- |
+| `20260405094019` | `InitialCreate`                       | `audit_logs` and base schema scaffolding.                           |
+| `20260406035003` | `AddProducts`                         | `products` and `product_components`, indexes for tenant + barcode.  |
+| `20260406121543` | `AddPackageUnpackFields`              | `unpack_target_product_id` and `unpack_quantity_per_package` columns. |
+| `20260413061238` | `AddTenantSettingsAndStockAlertLog`   | `tenant_settings`, `notification_recipients`, `stock_alert_logs`.   |
+| `20260413170816` | `AddWaybillsAndProductReservation`    | `waybills`, `waybill_items`, plus `reserved_quantity` on `products`. |
+
+`ApplicationDbContextModelSnapshot.cs` is auto-maintained by EF and reflects
+the current schema. Never hand-edit it — let `dotnet ef migrations add`
+update it.
+
+## Tenant-Scoped Schema
+
+Every domain table that holds tenant data carries a `tenant_id` column
+and a `(tenant_id, ...)` index for the typical lookup. Examples:
+
+- `products`: unique `(tenant_id, barcode)`, plus `(tenant_id, sku_code)`,
+  `(tenant_id, name)`, and `tenant_id` indexes.
+- `product_components`: unique `(tenant_id, parent_product_id, child_product_id)`.
+- `waybills`: tenant-scoped uniqueness on `(tenant_id, waybill_number)`.
+
+Tenant filtering is enforced in repository code (per the project rule)
+rather than via global query filters — every read/mutate method takes a
+`tenantId` argument.
+
+## Concurrency
+
+Stock-related fields use PostgreSQL's `xmin` system column as a
+concurrency token (configured in `ProductConfiguration`). When two
+requests update the same product simultaneously, the second
+`SaveChangesAsync` throws `DbUpdateConcurrencyException`. Handlers do
+not retry automatically; clients should re-fetch and retry the
+operation.
+
+## Audit Log Schema
+
+`audit_logs` records every change made through the `DbContext`. Columns:
+
+- `id`, `entity_name`, `entity_id`, `action` (`Created` / `Updated` / `Deleted`),
+- `changes` (JSON: `{ "Field": { "OldValue": ..., "NewValue": ... } }`),
+- `user_id`, `tenant_id`, `timestamp`.
+
+`AuditLogInterceptor` produces these rows. Properties tagged
+`[SensitiveData]` are excluded from `changes`.
+
+Writes happen in the same transaction as the entity changes — if the
+underlying save rolls back, the audit row rolls back with it.
+
+## Resetting Local Data
+
+Drop and recreate the database when you want a clean slate locally:
+
+```bash
+docker exec postgres dropdb -U vernon wrapsfer
+docker exec postgres createdb -U vernon wrapsfer
+dotnet ef database update \
+  --project src/Wrapsfer.Infrastructure/Wrapsfer.Infrastructure.csproj \
+  --startup-project src/Wrapsfer.Api/Wrapsfer.Api.csproj
+```
+
+## See Also
+
+- [Configuration](./configuration) — `ConnectionStrings:DefaultConnection` vs. `WRAPSFER_DESIGN_CONNECTION`.
+- [Architecture](./architecture#ef-core-persistence) — repositories, interceptors, and `IUnitOfWork`.
+- [Getting Started](../api/getting-started) — running migrations as part of the local setup.

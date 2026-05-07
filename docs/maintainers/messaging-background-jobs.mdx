@@ -1,0 +1,132 @@
+---
+title: Messaging & Background Jobs
+sidebar_label: Messaging & Background Jobs
+---
+
+# Messaging & Background Jobs
+
+The API uses RabbitMQ for asynchronous workloads — exports and email — and
+runs three hosted services in-process: the export consumers and a
+stale-draft-cancellation job.
+
+Connection settings come from the `RabbitMq` configuration section
+(see [Configuration](./configuration#rabbitmq)).
+
+## Queues
+
+| Queue              | Producer                                          | Consumer                  | Payload                                                          |
+| ------------------ | ------------------------------------------------- | ------------------------- | ---------------------------------------------------------------- |
+| `products.export`  | `RequestProductsExportCommandHandler`             | `ProductsExportConsumer`  | `ProductsExportRequestedMessage` (tenantId, requestedBy, format).|
+| `waybills.export`  | `RequestWaybillsExportCommandHandler`             | `WaybillsExportConsumer`  | `WaybillsExportRequestedMessage` (tenantId, requestedBy, format).|
+| `wrapsfer.mail`    | `RabbitMqMailer.SendAsync` (in `Wrapsfer.Mailing`)| `MailProcessingConsumer`  | `MailRequestedMessage` (recipients, template, tokens, attachments). |
+
+The mailing queue name is configurable via `Mailing:Queue:QueueName` and
+defaults to `wrapsfer.mail`. The export queue names are constants on
+their respective message records.
+
+All queues are declared as durable, persistent, non-exclusive,
+non-auto-delete (`channel.QueueDeclareAsync(name, durable: true,
+exclusive: false, autoDelete: false)`).
+
+## Publisher
+
+`RabbitMqMessagePublisher` (registered as a singleton) implements
+`IMessagePublisher` from `Wrapsfer.Application.Abstractions.Queue`.
+Behaviour notes:
+
+- Lazy connection / channel creation behind a `SemaphoreSlim` (single
+  `IConnection` and `IChannel` per process).
+- `BasicQosAsync(0, 1, false)` — prefetch count of `1` for fairness.
+- Messages are published with `Persistent = true`,
+  `ContentType = "application/json"`, no exchange (default), routing key
+  is the queue name.
+- Implements `IAsyncDisposable` and closes the channel/connection on
+  shutdown.
+
+The mail publisher (`RabbitMqMailer`) is similarly structured but lives
+in the `Wrapsfer.Mailing` module and uses its own `RabbitMqOptions`
+binding.
+
+## Consumers
+
+### `ProductsExportConsumer`
+
+Hosted service registered by `AddInfrastructure`. Listens on
+`products.export`. For each message it loads the tenant's products,
+builds CSV/XLSX rows via `IProductFileWriter`, and dispatches the
+result through `IMailer` using the `products-export` mail template
+with the file as an attachment.
+
+### `WaybillsExportConsumer`
+
+Same shape as the products consumer, but for waybills. Listens on
+`waybills.export`.
+
+### `MailProcessingConsumer`
+
+Lives in `Wrapsfer.Mailing.Queue`. Pulls from `wrapsfer.mail`, hydrates
+the `MailRequestedMessage` envelope back into a `MailMessage`, renders
+templates via `ITemplateRenderer`, and sends through `FluentEmailMailSender`
+(Resend). Failures are retried per `MailRetryPolicy` using
+`Mailing:Queue:MaxRetries` and `Mailing:Queue:InitialBackoffSeconds` for
+exponential backoff. See [Mailing](./mailing).
+
+## Background Jobs
+
+### `AutoCancelStaleDraftsJob`
+
+Hosted service registered by `AddInfrastructure`. Behaviour:
+
+- Runs once per hour via `PeriodicTimer(TimeSpan.FromHours(1))`.
+- Fetches stale draft waybills from `IWaybillRepository.GetStaleDraftsAsync`
+  (those whose `PackagingDate` is past relative to today).
+- For each stale draft:
+  1. Loads the waybill with its items.
+  2. Releases the items' stock reservations through
+     `StockReservationService.ReleaseItemsAsync`.
+  3. Calls `waybill.Cancel("Auto-cancelled: stale draft")`.
+  4. Saves through `IUnitOfWork`.
+- Each waybill is processed in its own DI scope. Failures are logged but
+  do not stop the loop.
+- Logs a summary line:
+  `"Auto-cancelled {Count} of {Total} stale draft waybills"`.
+
+The same data is exposed for inspection through
+`GET /api/v1/waybills/stale-drafts-report?hoursBack=...`.
+
+## Failure Handling
+
+- **Publisher** — `PublishAsync` throws on connection or publish failure;
+  callers (handlers) propagate the failure as `Result.Failure`. Imports
+  and exports treat publishing as part of the request work.
+- **Consumers** — exceptions inside a consumer leave the message
+  unacknowledged so RabbitMQ redelivers it. There is no dead-letter queue
+  configured.
+- **Mail** — `MailRetryPolicy` retries transient failures up to
+  `MaxRetries` with exponential backoff. After that, the message is
+  rejected.
+
+If you add a new consumer:
+
+1. Place the message record next to the producer (e.g.
+   `Application/Foo/Messaging/FooRequestedMessage.cs`) with a
+   `public const string QueueName = "...";`.
+2. Implement the consumer as a `BackgroundService` in
+   `Infrastructure/BackgroundServices/`.
+3. Register it via `AddHostedService<TConsumer>()` inside
+   `Infrastructure.DependencyInjection.AddInfrastructure`.
+4. Declare the queue from both producer and consumer sides
+   (`channel.QueueDeclareAsync` is idempotent).
+
+## Health Checks
+
+`AddHealthChecks().AddRabbitMQ(...)` is wired in
+`ServiceCollectionExtensions.AddServices`, so `/health` reflects RabbitMQ
+liveness alongside Postgres. A failed RabbitMQ connection causes the
+health endpoint to surface unhealthy.
+
+## See Also
+
+- [Mailing](./mailing) — the consumer side of `wrapsfer.mail`, templates, and Resend integration.
+- [Imports & Exports](../api/imports-exports) — consumer-facing description of the export workflow.
+- [Configuration](./configuration#rabbitmq) — required RabbitMQ keys.

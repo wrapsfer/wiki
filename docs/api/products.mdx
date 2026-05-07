@@ -1,0 +1,261 @@
+---
+title: Products
+sidebar_label: Products
+---
+
+# Products
+
+The Products module is the tenant catalogue. Every endpoint is mounted at
+`/api/v1/products` and inherits `[Authorize]` from `ApiControllerBase`.
+Owner-realm callers must include `?tenantId=...` (see
+[Authentication & Tenancy](./authentication-tenancy)).
+
+## Concepts
+
+`ProductType` distinguishes three product shapes:
+
+| Type      | Has stock? | Has components? | Has unpack target? | Notes                                                    |
+| --------- | ---------- | --------------- | ------------------ | -------------------------------------------------------- |
+| `Single`  | Yes        | No              | No                 | The leaf SKU. Bundle/Package quantities derive from these. |
+| `Bundle`  | Derived    | Yes (children)  | No                 | Fulfilled from its `Components` (each child a `Single`). |
+| `Package` | Yes        | No              | Yes (a `Single`)   | A pre-pack that can be unpacked into its target product. |
+
+Stock fields:
+
+- `stockQuantity` — total on hand (`Single` and `Package` only).
+- `reservedQuantity` — units reserved by open waybills.
+- `availableQuantity` (computed) = `stockQuantity − reservedQuantity`.
+- `lowStockThreshold` — optional per-product threshold; otherwise the
+  tenant's `DefaultLowStockThreshold`, otherwise the global
+  `ProductSettings:GlobalLowStockThreshold` (default `10`).
+
+**Tenant-scoped uniqueness** — `(tenantId, barcode)` is unique. SKU is
+indexed but not unique. Two tenants may share a barcode.
+
+## `ProductResponse`
+
+```json
+{
+  "id": "8c3f...-...",
+  "barcode": "4900000000001",
+  "skuCode": "SKU-1",
+  "name": "Acme Widget",
+  "type": "Single",
+  "cost": 9.99,
+  "stockQuantity": 120,
+  "lowStockThreshold": 10,
+  "createdAt": "2026-04-01T10:00:00Z",
+  "updatedAt": "2026-04-30T14:00:00Z",
+  "components": []
+}
+```
+
+`components` is populated for `Bundle` products and contains
+`{id, childProductId, childProductName, childProductBarcode, quantity}` per
+child.
+
+## Create
+
+```http
+POST /api/v1/products
+Content-Type: application/json
+Authorization: Bearer <jwt>
+```
+
+Request body (`CreateProductCommand`):
+
+| Field                       | Type                            | Required | Notes                                                          |
+| --------------------------- | ------------------------------- | -------- | -------------------------------------------------------------- |
+| `barcode`                   | string                          | yes      | Unique within tenant.                                          |
+| `name`                      | string                          | yes      |                                                                |
+| `skuCode`                   | string?                         | no       |                                                                |
+| `type`                      | `"Single" \| "Bundle" \| "Package"` | yes  |                                                                |
+| `cost`                      | decimal                         | yes      | `≥ 0`.                                                         |
+| `stockQuantity`             | int                             | yes      | `≥ 0`. Bundle quantity is derived; pass `0`.                   |
+| `lowStockThreshold`         | int?                            | no       | `≥ 0`.                                                         |
+| `unpackTargetProductId`     | guid?                           | Package  | Required when `type=Package`.                                  |
+| `unpackQuantityPerPackage`  | int?                            | Package  | Required and `> 0` when `type=Package`.                        |
+| `components`                | `[{ childProductId, quantity }]`| Bundle   | Required for `Bundle`. No duplicate child IDs; quantity `> 0`. |
+
+Returns `201 Created` with the new product's `Guid`.
+
+## List
+
+```http
+GET /api/v1/products?search=widget&type=Single&page=1&pageSize=20
+```
+
+| Query      | Type                | Default |
+| ---------- | ------------------- | ------- |
+| `search`   | string?             | —       |
+| `type`     | `ProductType?`      | —       |
+| `page`     | int                 | `1`     |
+| `pageSize` | int                 | `20`    |
+
+Returns `200 OK` with `PagedResult<ProductResponse>`:
+
+```json
+{
+  "items": [ /* ProductResponse[] */ ],
+  "totalCount": 42,
+  "page": 1,
+  "pageSize": 20
+}
+```
+
+## Get By ID / Barcode / SKU
+
+```http
+GET /api/v1/products/{id}
+GET /api/v1/products/by-barcode/{barcode}
+GET /api/v1/products/by-sku/{skuCode}
+```
+
+Route constraints:
+
+- `id` must be a `Guid`.
+- `barcode` and `skuCode` are limited to 256 characters.
+
+`200 OK` with a single `ProductResponse`, or `404 Not Found` when no record
+matches the tenant + key.
+
+## Update
+
+```http
+PUT /api/v1/products/{id}
+Content-Type: application/json
+```
+
+Body (`UpdateProductRequest`):
+
+```json
+{
+  "name": "Acme Widget v2",
+  "skuCode": null,
+  "clearSkuCode": false,
+  "cost": 12.50,
+  "lowStockThreshold": 25,
+  "clearLowStockThreshold": false,
+  "unpackTargetProductId": null,
+  "unpackQuantityPerPackage": null,
+  "components": null
+}
+```
+
+Field semantics:
+
+- All fields are optional. `null` means "do not change".
+- `clearSkuCode: true` removes the SKU; otherwise `skuCode` (when
+  non-null) sets it.
+- `clearLowStockThreshold: true` removes the threshold; otherwise
+  `lowStockThreshold` (when non-null) sets it.
+- `components` may be supplied to replace a Bundle's child list.
+- Returns `204 No Content` on success.
+
+## Delete
+
+```http
+DELETE /api/v1/products/{id}
+```
+
+`204 No Content` on success. Conflicts with referenced bundles or active
+waybills surface as `400 Bad Request` with the corresponding domain error
+code.
+
+## Update Stock
+
+```http
+PATCH /api/v1/products/{id}/stock
+Content-Type: application/json
+
+{ "newQuantity": 55 }
+```
+
+Sets the absolute on-hand quantity. The handler raises a
+`LowStockDetectedEvent` when stock crosses below the resolved threshold,
+and a `StockRecoveredEvent` when it crosses back above. Bundles cannot
+have their stock set directly — their availability is derived from
+component stock.
+
+Returns `204 No Content` on success.
+
+## Unpack A Package
+
+```http
+POST /api/v1/products/{id}/unpack
+Content-Type: application/json
+
+{ "quantity": 1 }
+```
+
+For a `Package` product:
+
+- Decrements the package's own `stockQuantity` by `quantity`.
+- Increments the **target product's** `stockQuantity` by
+  `quantity × UnpackQuantityPerPackage`.
+- The target product may emit `LowStockDetectedEvent` /
+  `StockRecoveredEvent` based on its threshold.
+
+Defaults to `quantity = 1` when omitted.
+
+Returns `204 No Content` on success.
+
+## Import
+
+See the dedicated [Imports & Exports](./imports-exports#products-import)
+page for upload constraints, content types, and the per-row error format.
+
+```http
+POST /api/v1/products/import?format=Csv
+Content-Type: multipart/form-data
+```
+
+Returns `200 OK` with a `ProductImportResult` body. The endpoint always
+returns `200` even when the file had row-level errors — inspect
+`errors[]` to decide whether the import succeeded.
+
+## Export (Async)
+
+```http
+POST /api/v1/products/export?format=Xlsx
+```
+
+Publishes a `products.export` message to RabbitMQ and returns
+`202 Accepted`:
+
+```json
+{ "message": "Export requested. You'll receive it by email shortly.", "format": "Xlsx" }
+```
+
+The `ProductsExportConsumer` background service picks the message up,
+generates the file, and emails it via the mail queue. See
+[Imports & Exports](./imports-exports#products-export) for the consumer
+flow.
+
+## Import Template
+
+```http
+GET /api/v1/products/import-template?format=Csv
+```
+
+Returns a downloadable file (CSV or XLSX) with three sample rows — one
+each for `Single`, `Bundle`, and `Package`. Use it as the canonical schema
+when preparing an import.
+
+## Errors
+
+Common errors specific to Products (full list in
+`Wrapsfer.Domain.Errors.ProductErrors` and `ProductImportErrors`):
+
+| Code                              | Status |
+| --------------------------------- | ------ |
+| `Product.NotFound`                | `404`  |
+| `Product.BarcodeAlreadyExists`    | `409`  |
+| `Product.InvalidStockChange`      | `400`  |
+| `Product.BundleHasNoComponents`   | `400`  |
+| `Product.InvalidUnpackTarget`     | `400`  |
+| `ProductImport.FileRequired`      | `400`  |
+| `ProductImport.FileTooLarge`      | `400`  |
+| `ProductImport.UnsupportedFormat` | `400`  |
+| `ProductImport.EmptyFile`         | `400`  |
+| `ProductImport.CorruptedFile`     | `400`  |

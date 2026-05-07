@@ -1,0 +1,248 @@
+---
+title: Waybills
+sidebar_label: Waybills
+---
+
+# Waybills
+
+A waybill is the document a partner uses to pack and hand off a shipment.
+Endpoints live under `/api/v1/waybills` and require authentication.
+Owner-realm callers must include `?tenantId=...`.
+
+## Lifecycle
+
+`WaybillStatus` has four states. The valid transitions are:
+
+```
+Draft ──mark-packed──▶ Packed ──mark-handed-off──▶ HandedOff
+  │                       │
+  └─────cancel────────────┴─────cancel─────────▶ Cancelled
+```
+
+| Status      | Mutations allowed                                                                  |
+| ----------- | ---------------------------------------------------------------------------------- |
+| `Draft`     | Update number, add/update/remove items, mark-packed, cancel.                       |
+| `Packed`    | Mark handed off (creator only), cancel.                                            |
+| `HandedOff` | None. Cancel returns `Waybill.CannotCancelAfterHandedOff`.                         |
+| `Cancelled` | None. Cancel again returns `Waybill.InvalidStatusTransition`.                      |
+
+`MarkHandedOff` checks `actingUserId == waybill.CreatedBy` — only the
+creator may complete the hand-off. Failure returns
+`Waybill.NotWaybillCreator`.
+
+## Stock Reservation
+
+`StockReservationService` keeps `Product.ReservedQuantity` in sync with
+open waybills:
+
+- **Add or increment item (Draft)** — reserves the requested quantity on
+  the underlying leaf products. Bundles are expanded into their `Single`
+  components first; reservation hits each leaf.
+- **Update item quantity (Draft)** — reserves or releases the delta.
+- **Remove item (Draft)** — releases the item's quantity.
+- **Mark packed** — no reservation change. Stock stays reserved.
+- **Mark handed off** — `Consume` operation: decrements `StockQuantity` by
+  the reserved amount and decrements `ReservedQuantity` to match.
+- **Cancel from Draft or Packed** — releases the reservation back to
+  available stock.
+- **Cancel from HandedOff** — rejected with
+  `Waybill.CannotCancelAfterHandedOff`.
+
+Reservation failures (e.g. not enough available stock for a leaf) return
+through `Result.Failure` with the corresponding `ProductErrors` code.
+
+## `WaybillResponse`
+
+```json
+{
+  "id": "...",
+  "packagingDate": "2026-05-08",
+  "waybillNumber": "WB-2026-0001",
+  "status": "Draft",
+  "cancellationReason": null,
+  "packedAt": null,
+  "handedOffAt": null,
+  "cancelledAt": null,
+  "createdAt": "2026-05-07T10:00:00Z",
+  "updatedAt": null,
+  "createdBy": "550e8400-e29b-41d4-a716-446655440000",
+  "items": [
+    {
+      "id": "...",
+      "productId": "...",
+      "productBarcode": "4900000000001",
+      "productName": "Acme Widget",
+      "quantity": 12
+    }
+  ]
+}
+```
+
+## Create
+
+```http
+POST /api/v1/waybills
+Content-Type: application/json
+
+{ "packagingDate": "2026-05-08", "waybillNumber": "WB-2026-0001" }
+```
+
+Creates a `Draft` waybill. `waybillNumber` is required, max 100 characters,
+and must be unique within the tenant. Returns `201 Created` with the new
+waybill's `Guid`.
+
+## List
+
+```http
+GET /api/v1/waybills?from=2026-05-01&to=2026-05-31&status=Draft&search=WB-2026&page=1&pageSize=20
+```
+
+| Query      | Type             | Default |
+| ---------- | ---------------- | ------- |
+| `from`     | `DateOnly?`      | —       |
+| `to`       | `DateOnly?`      | —       |
+| `status`   | `WaybillStatus?` | —       |
+| `search`   | string?          | —       |
+| `page`     | int              | `1`     |
+| `pageSize` | int              | `20`    |
+
+Returns `PagedResult<WaybillResponse>`.
+
+## Get By Id / Date
+
+```http
+GET /api/v1/waybills/{id}
+GET /api/v1/waybills/by-date/{packagingDate}
+```
+
+`by-date` returns `IReadOnlyList<WaybillResponse>` for the given
+`DateOnly`. Both filter by tenant.
+
+## Number Availability
+
+```http
+GET /api/v1/waybills/number-available?waybillNumber=WB-2026-0001
+```
+
+Returns `200 OK` with a JSON boolean — `true` means the number is free for
+this tenant. Useful for inline validation in a UI.
+
+## Stale Drafts Report
+
+```http
+GET /api/v1/waybills/stale-drafts-report?hoursBack=48
+```
+
+Lists `Draft` waybills older than `hoursBack`. The same data is what the
+`AutoCancelStaleDraftsJob` background service operates against; this
+endpoint surfaces it for inspection. Returns `IReadOnlyList<WaybillResponse>`.
+
+## Update Number
+
+```http
+PUT /api/v1/waybills/{id}
+Content-Type: application/json
+
+{ "waybillNumber": "WB-2026-0002" }
+```
+
+Allowed only when the waybill is in `Draft`. Returns
+`Waybill.CannotEditNonDraft` (`400`) otherwise.
+
+## Delete
+
+```http
+DELETE /api/v1/waybills/{id}
+```
+
+`204 No Content`. Subject to domain rules around status and reservations.
+
+## Items
+
+| Method   | Path                                                  | Effect                                                          |
+| -------- | ----------------------------------------------------- | --------------------------------------------------------------- |
+| `POST`   | `/api/v1/waybills/{id}/items`                         | Add or increment by barcode. Reserves the delta. `201 Created`. |
+| `PUT`    | `/api/v1/waybills/{id}/items/{itemId}`                | Set quantity. Reserves/releases the delta. `204 No Content`.    |
+| `DELETE` | `/api/v1/waybills/{id}/items/{itemId}`                | Remove. Releases the reservation. `204 No Content`.             |
+
+Add request:
+
+```json
+{ "barcode": "4900000000001", "quantity": 12 }
+```
+
+Update request:
+
+```json
+{ "quantity": 15 }
+```
+
+All item mutations require the waybill to be in `Draft`. The barcode is
+resolved against the tenant's catalogue; missing → `Product.NotFound`
+(`404`). Quantities must be `> 0`.
+
+## Mark Packed
+
+```http
+POST /api/v1/waybills/{id}/mark-packed
+```
+
+`Draft → Packed`. Rejected when the waybill is empty (`Waybill.EmptyWaybill`).
+Stock stays reserved. Sets `PackedAt`.
+
+## Mark Handed Off
+
+```http
+POST /api/v1/waybills/{id}/mark-handed-off
+```
+
+`Packed → HandedOff`. Allowed only for the user identified by `CreatedBy`.
+On success, the reservation is consumed: `StockQuantity` and
+`ReservedQuantity` both drop by the item totals. Sets `HandedOffAt`.
+
+## Cancel
+
+```http
+POST /api/v1/waybills/{id}/cancel
+Content-Type: application/json
+
+{ "reason": "Customer cancelled order" }
+```
+
+- `reason` is required and trimmed (`Waybill.CancellationReasonRequired`).
+- From `Draft` or `Packed`: status becomes `Cancelled`, items'
+  reservations are released, `CancelledAt` and `CancellationReason` are
+  set.
+- From `HandedOff`: rejected with `Waybill.CannotCancelAfterHandedOff`.
+- From `Cancelled`: rejected with `Waybill.InvalidStatusTransition`.
+
+Returns `204 No Content` on success.
+
+## Export (Async)
+
+```http
+POST /api/v1/waybills/export?format=Csv
+```
+
+Publishes a `waybills.export` message; `WaybillsExportConsumer` builds
+the file and emails it to the tenant's notification recipients (or the
+requester) via the mail queue. See
+[Imports & Exports](./imports-exports#waybills-export) for details.
+
+## Errors
+
+| Code                                  | Status |
+| ------------------------------------- | ------ |
+| `Waybill.NotFound`                    | `404`  |
+| `Waybill.CannotEditNonDraft`          | `400`  |
+| `Waybill.InvalidStatusTransition`     | `400`  |
+| `Waybill.EmptyWaybill`                | `400`  |
+| `Waybill.NotWaybillCreator`           | `400`  |
+| `Waybill.CancellationReasonRequired`  | `400`  |
+| `Waybill.CannotCancelAfterHandedOff`  | `400`  |
+| `Waybill.WaybillNumberAlreadyExists`  | `409`  |
+| `Waybill.WaybillNumberTooLong`        | `400`  |
+| `Waybill.InvalidQuantity`             | `400`  |
+| `Waybill.ItemNotFound`                | `404`  |
+| `Product.NotFound`                    | `404`  |
+| `Product.InvalidStockChange`          | `400`  |

@@ -9,46 +9,62 @@ sidebar_label: Introduction
 Reference for the **current** behavior of the Wrapsfer API, written for API
 consumers, backend developers, and future maintainers.
 
-## What Wrapsfer API Is Today
+## What Wrapsfer Is
 
-Wrapsfer API is a minimal **.NET 10 Web API boilerplate** organized around a
-small Clean Architecture-style layout (`Api`, `Application`, `Domain`,
-`Infrastructure`). It ships with the production-oriented foundations a service
-typically needs — health checks, OpenAPI in development, configuration,
-dependency injection, CORS, global exception handling, data-annotation
-validation, unit and integration tests, and Docker support — without any
-authentication, persistence, or vendor-specific dependencies.
+Wrapsfer is a **tenant-aware logistics and warehouse API** built on .NET 10. It
+manages a partner's catalogue of products, waybills used to pack and hand off
+shipments, and the supporting concerns around them — stock tracking, low-stock
+alerting, CSV/XLSX import and export, audit logging, and email notifications.
 
-The functional surface today is a **sample greeting endpoint** that exists to
-demonstrate the layering. Real domain endpoints have not been added yet.
+Every authenticated request is bound to a tenant (a Keycloak realm). Owner-realm
+users may act on behalf of a partner tenant by passing a `tenantId` query
+parameter. Repository queries and mutations are scoped to that tenant.
 
-This documentation describes only what exists in the codebase. It does not
-describe planned future behavior.
+This documentation describes only what is implemented in the codebase today.
 
-## Current Endpoints
+## At A Glance
 
-| Method | Path                          | Notes                                          |
-| ------ | ----------------------------- | ---------------------------------------------- |
-| `GET`  | `/health`                     | Service health check.                          |
-| `GET`  | `/api/greetings?name={name}`  | Sample greeting from the application/domain layers. `name` is validated by `[StringLength]`. |
-| `GET`  | `/openapi/v1.json`            | OpenAPI document. Available in **development** only. |
+- **Versioned routes.** All resource endpoints live under `/api/v1/...` and
+  are decorated with `[Authorize]` through `ApiControllerBase`.
+- **Authentication.** Keycloak JWT bearer tokens, with per-realm OIDC
+  discovery via a multi-tenant `JwtBearerEvents` handler.
+- **Tenant resolution.** Realm derived from the `X-Tenant-Realm` header or
+  the request subdomain, with an owner-realm override path for partner
+  operations.
+- **Persistence.** PostgreSQL via EF Core, with `AuditableEntity`,
+  `DomainEvent`, and `AuditLog` interceptors hooked into `SaveChanges`.
+- **Messaging.** RabbitMQ-backed export consumers and a mail-processing
+  consumer; a background job auto-cancels stale draft waybills hourly.
+- **Mailing.** Resend via FluentEmail, with Fluid templates rendered from
+  files for low-stock alerts, stock recovery, and product exports.
 
-Quick check against a locally running instance:
+## Modules
 
-```bash
-curl http://localhost:8080/health
-curl "http://localhost:8080/api/greetings?name=Vernon"
-```
+| Module               | Route                              | Purpose                                                |
+| -------------------- | ---------------------------------- | ------------------------------------------------------ |
+| Me                   | `GET /api/v1/me`                   | Current user, tenant, and roles.                       |
+| Products             | `/api/v1/products`                 | Catalogue: Single, Bundle, Package products.           |
+| Waybills             | `/api/v1/waybills`                 | Pack/handoff lifecycle with stock reservation.         |
+| Tenant Settings      | `/api/v1/tenant-settings`          | Default low-stock threshold and email recipients.      |
+| Stock Alerts         | `/api/v1/stock-alerts`             | Read-only history of low-stock and recovery events.    |
+| Health               | `GET /health`                      | DB and RabbitMQ liveness aggregate.                    |
+| OpenAPI              | `GET /openapi/v1.json`             | OpenAPI document, **Development only**.                |
 
 ## Where To Go Next
 
 For API consumers:
 
-- [API Overview](./api/overview) — what the API is and how it is structured.
-- [Getting Started](./api/getting-started) — run the API locally and call an endpoint.
-- [Endpoint Reference](./api/endpoint-reference) — request/response details for each endpoint.
+- [API Overview](./api/overview) — the implemented stack and module map.
+- [Getting Started](./api/getting-started) — run the API locally with PostgreSQL, Keycloak, and RabbitMQ.
+- [Authentication & Tenancy](./api/authentication-tenancy) — JWT, realms, owner-realm impersonation.
+- [Products](./api/products), [Waybills](./api/waybills),
+  [Tenant Settings](./api/tenant-settings), [Stock Alerts](./api/stock-alerts) — module references.
+- [Errors & Validation](./api/errors-validation) — the `ProblemDetails` contract.
 
 For backend developers and maintainers:
 
-- [Configuration](./maintainers/configuration) — `appsettings.json`, environment variables, CORS, and app options.
-- [Development Workflow](./maintainers/development-workflow) — recommended flow for adding a feature.
+- [Architecture](./maintainers/architecture) — Clean Architecture, CQRS, interceptors, Result pattern.
+- [Configuration](./maintainers/configuration) — `appsettings.json`, environment variables, secrets.
+- [Database & Migrations](./maintainers/database-migrations) — EF Core CLI, design-time factory, current migrations.
+- [Messaging & Background Jobs](./maintainers/messaging-background-jobs) — RabbitMQ producer, consumers, and the stale-draft job.
+- [Mailing](./maintainers/mailing) — Resend, templates, mail queue.

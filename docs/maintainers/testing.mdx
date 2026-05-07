@@ -5,104 +5,141 @@ sidebar_label: Testing
 
 # Testing
 
-How the Wrapsfer API is tested today, and the commands used to run those tests locally. Two test projects live under `tests/`:
+The Wrapsfer API has four test projects under `tests/`. Together they cover
+domain invariants, application handlers/validators, the mailing module,
+and end-to-end HTTP behavior.
 
-- `Wrapsfer.UnitTests` — fast tests for the Domain layer (and Application code, when it grows).
-- `Wrapsfer.IntegrationTests` — endpoint tests that boot the API in-memory via `Microsoft.AspNetCore.Mvc.Testing`.
+| Project                       | References                              | Scope                                                            |
+| ----------------------------- | --------------------------------------- | ---------------------------------------------------------------- |
+| `Wrapsfer.Domain.Tests`       | `Wrapsfer.Domain`                       | Pure domain rules — entity factories, mutators, `Result` failures. |
+| `Wrapsfer.Application.Tests`  | `Wrapsfer.Application`, `Wrapsfer.Domain` | Handler and validator behavior. Repositories are mocked via Moq. |
+| `Wrapsfer.Mailing.Tests`      | `Wrapsfer.Mailing`                      | Template rendering, queue envelope serialization, retry policy. |
+| `Wrapsfer.IntegrationTests`   | `Wrapsfer.Api`                          | `WebApplicationFactory<Program>`-based HTTP tests.               |
 
-Both use **xUnit 2.9.3** with the standard MSBuild test runner (`Microsoft.NET.Test.Sdk 17.14.1`) and `coverlet.collector 6.0.4` for coverage. Verified against `tests/Wrapsfer.UnitTests/Wrapsfer.UnitTests.csproj` and `tests/Wrapsfer.IntegrationTests/Wrapsfer.IntegrationTests.csproj`.
+The frameworks are **xUnit + Moq + FluentAssertions**, with
+`coverlet.collector` for coverage. Solution file is `Wrapsfer.slnx`.
 
-## Running The Tests
-
-From the API repository root:
+## Running Tests
 
 ```bash
-dotnet test
+make restore          # dotnet restore
+make build            # dotnet build --no-restore
+make test             # dotnet test --no-restore --no-build
 ```
 
-`dotnet test` discovers every test project listed in `Wrapsfer.slnx` and runs them. Subset commands:
+Subset commands:
 
 ```bash
-# unit tests only
-dotnet test tests/Wrapsfer.UnitTests
-
-# integration tests only
+# Single project
+dotnet test tests/Wrapsfer.Domain.Tests
+dotnet test tests/Wrapsfer.Application.Tests
+dotnet test tests/Wrapsfer.Mailing.Tests
 dotnet test tests/Wrapsfer.IntegrationTests
 
-# skip restore / build when you have already built the solution
-dotnet test --no-build
+# Single test by FQN substring
+dotnet test --no-restore --no-build \
+  --filter "FullyQualifiedName~CreateProductCommandHandlerTests.Handle_ReturnsConflict_WhenBarcodeExists"
 
-# run a single test by name
-dotnet test --filter "FullyQualifiedName~GreetingsEndpointTests"
-```
-
-The integration tests spin up the API host in-process on each `IClassFixture<WebApplicationFactory<Program>>`, so no separate `dotnet run` is required.
-
-## Unit Tests — `Wrapsfer.UnitTests`
-
-References `Wrapsfer.Application` and `Wrapsfer.Domain`. Today it contains a single test class that pins the existing domain rules.
-
-`tests/Wrapsfer.UnitTests/GreetingTests.cs`:
-
-| Test | What it asserts |
-| ---- | --------------- |
-| `Create_TrimsNameAndFormatsMessage` | `Greeting.Create("  Vernon  ")` produces `Name == "Vernon"` and `Message == "Hello, Vernon!"` — covers the trimming and message-format rules. |
-| `Create_ThrowsWhenNameIsBlank`      | `Greeting.Create("   ")` throws `ArgumentException` — covers the non-empty-after-trim invariant. |
-
-Both rules are documented under [Business Rules → Domain Rules](../api/business-rules#domain-rules--greeting). When new domain or application behavior is added, follow the same pattern: add a focused unit test to this project before exposing the behavior through HTTP.
-
-## Integration Tests — `Wrapsfer.IntegrationTests`
-
-References `Wrapsfer.Api` and pulls in `Microsoft.AspNetCore.Mvc.Testing 10.0.7`. Each test class implements `IClassFixture<WebApplicationFactory<Program>>` to share an in-memory host across the class's tests.
-
-Two test classes today:
-
-`tests/Wrapsfer.IntegrationTests/HealthEndpointTests.cs`:
-
-| Test | What it asserts |
-| ---- | --------------- |
-| `Health_ReturnsOk` | `GET /health` returns `200 OK` from the in-memory host. |
-
-`tests/Wrapsfer.IntegrationTests/GreetingsEndpointTests.cs`:
-
-| Test | What it asserts |
-| ---- | --------------- |
-| `Get_ReturnsGreeting` | `GET /api/greetings?name=Vernon` returns `200 OK`; the JSON body deserializes into `(string Message, DateTimeOffset GeneratedAt)` and `Message == "Hello, Vernon!"`. |
-
-The deserialization succeeding also implicitly confirms the camelCase wire shape — see [Endpoint Reference → Success response](../api/endpoint-reference#success-response).
-
-These tests do **not** assert the validation-failure path or the 500 problem-details body. When validation or error-handling behavior changes, add tests that pin those responses.
-
-### How `WebApplicationFactory<Program>` Works Here
-
-- `Wrapsfer.Api/Program.cs` declares `public partial class Program;` at the bottom of the file. This makes the top-level program statements addressable as a class, which `WebApplicationFactory<Program>` uses as the entry point for the in-memory host.
-- `factory.CreateClient()` returns an `HttpClient` rooted at the in-memory server (e.g. `http://localhost`). Tests issue real `HttpRequestMessage`s through it; ASP.NET Core's pipeline runs end to end, including `ExceptionHandlingMiddleware`, CORS, and routing.
-- The `IClassFixture<WebApplicationFactory<Program>>` fixture is shared across the class, so the host is constructed once per class and disposed afterwards.
-- No test substitutes services today (`factory.WithWebHostBuilder(...)` is not used). The integration tests run against the same DI graph as production (`TimeProvider.System`, real options binding, real CORS policy). Substitute services per test class only when needed.
-
-## Quality Check Commands
-
-Safe, repeatable commands to run before committing changes:
-
-```bash
-dotnet restore                # pull NuGet packages
-dotnet build --no-restore     # compile every project
-dotnet test --no-build        # run all xUnit tests against the just-built bits
-```
-
-These three commands match the workflow from `api/README.md` ("Quality Checks") and avoid redundant restore/build cycles when chained. Each is idempotent: running them on a clean checkout reproduces the same artifacts.
-
-For coverage:
-
-```bash
+# Coverage
 dotnet test --collect:"XPlat Code Coverage"
 ```
 
-This uses `coverlet.collector` (already referenced by both test projects) to emit a Cobertura XML file under each test project's `TestResults/` directory.
+The integration tests host the API in-process; no separate `dotnet run`
+is needed. They share infrastructure connections via the standard
+`IClassFixture<WebApplicationFactory<Program>>` pattern.
+
+## What Each Project Covers
+
+### `Wrapsfer.Domain.Tests`
+
+Tests pin the invariants in `Wrapsfer.Domain.Entities` aggregates and
+their `*Errors` static catalogues:
+
+- `Product` — factory validation, stock mutations, threshold-event
+  emission, unpack mechanics.
+- `Waybill` — status transitions, item add/update/remove rules,
+  cancellation invariants, hand-off creator-only check.
+- `TenantSettings` — recipient add/remove, email format check.
+
+Domain tests have **zero framework dependencies** beyond xUnit; do not
+introduce HTTP, EF, or DI types here.
+
+### `Wrapsfer.Application.Tests`
+
+Tests handlers and validators for each module's `Commands/` and
+`Queries/`. Pattern:
+
+- Mock `IProductRepository`, `IWaybillRepository`,
+  `IUnitOfWork`, `ITenantContext`, `IMessagePublisher`, `IMailer` via
+  Moq.
+- Use FluentAssertions for `Result<T>` and `Result` checks
+  (`result.IsSuccess.Should().BeTrue()`, etc.).
+- Run handlers directly without MediatR; behaviors
+  (`ValidationBehavior`) are tested separately.
+
+### `Wrapsfer.Mailing.Tests`
+
+Tests for the standalone mailing module:
+
+- `FluidTemplateRenderer` — renders the on-disk Liquid templates with a
+  given token dictionary.
+- `RabbitMqMailer` — envelope serialization (`MailRequestedMessage`),
+  required-field validation (`To`, mutually-exclusive
+  `Subject/Body` vs. `TemplateName`).
+- `MailRetryPolicy` — backoff schedule for transient failures.
+
+### `Wrapsfer.IntegrationTests`
+
+Boots the real ASP.NET Core host with `WebApplicationFactory<Program>`.
+`Program.cs` declares `public partial class Program;` so the entry
+point is addressable. Each test class uses
+`IClassFixture<WebApplicationFactory<Program>>` to share the host
+across the class.
+
+These tests are scaffolded today — extend them when adding new
+endpoints. Common substitutions:
+
+- Override `JwtBearer` validation with a test scheme that accepts a
+  fake token.
+- Replace `IMessagePublisher` and `IMailer` with in-memory test doubles
+  to avoid hitting RabbitMQ in CI.
+- Replace `ApplicationDbContext` with a Postgres test database (or
+  Testcontainers) when full DB behavior is required.
+
+## Conventions From `CLAUDE.md`
+
+These project-wide rules influence how tests are written:
+
+- **No `var`.** Always use explicit types (enforced by
+  `dotnet format style` and a pre-commit hook).
+- **One type per file.** Every test class, helper, or fake gets its own
+  file.
+- **Tenant isolation.** Repository tests must always exercise the
+  `tenantId` argument; never simulate "global" reads.
+- **Domain validation via `Result`.** Assert on `Result.IsSuccess` /
+  `Result.Error.Code`, not on thrown exceptions, for business
+  validation paths.
+- **Concurrency.** When a test exercises stock mutation paths, pin the
+  expected `xmin`-style concurrency token behavior (e.g. throwing
+  `DbUpdateConcurrencyException` on stale updates).
+
+## Quality Check Commands
+
+Run before committing:
+
+```bash
+make restore
+make build           # TreatWarningsAsErrors is on globally — warnings will fail.
+make test
+make format-all      # whitespace + style fixes (dotnet format + dotnet format style)
+```
+
+`format-all` runs `dotnet format` followed by `dotnet format style`. The
+pre-commit hook enforces `var`-free code and the no-consecutive-blank-lines
+rule.
 
 ## See Also
 
-- [Architecture](./architecture) — what each project layer is responsible for, and where new tests should live.
-- [Development Workflow](./development-workflow) — recommended flow for adding a feature, including where tests fit in.
-- [Endpoint Reference](../api/endpoint-reference) — the contracts the integration tests assert against.
-- [Business Rules](../api/business-rules) — the rules the unit tests pin.
+- [Architecture](./architecture) — where new tests should live for each module.
+- [Development Workflow](./development-workflow) — adding a feature end to end.
+- [CLAUDE.md](https://github.com/) — repo-level coding rules (lives in the API repo, not this site).
